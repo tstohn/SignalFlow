@@ -1,43 +1,51 @@
 # SignalFlow v0 — conditional flow matching for perturbation response
 
-Deliberately the simplest thing that is still the *right shape*. Every
-component that will need to get smarter is a separate swappable class with its
-upgrade path written next to it.
+Predicts what single cells look like after a CRISPR knockout, by learning a
+**velocity field** that transports control cells onto perturbed cells.
+
+Deliberately the simplest thing that is still the *right shape*: every piece
+that will need to get smarter is an isolated, swappable class with its upgrade
+path written next to it.
 
 ```bash
-python -m signalflow.data.prepare --config configs/prototype.yaml
-python -m signalflow.train        --config configs/prototype.yaml
+cd /Users/timstohn/Desktop/SignalFlow
+
+python -m signalflow.data.prepare --config configs/prototype.yaml   # ~40 s
+python -m signalflow.train        --config configs/prototype.yaml   # ~14 s/epoch (MPS)
 python -m signalflow.evaluate     --config configs/prototype.yaml --split test
 ```
 
+Everything is driven by `configs/prototype.yaml`. Run from the repo root
+(`signalflow/` is not installed as a package).
+
 ---
 
-## What the model outputs, and why
-
-**A per-cell velocity field. Cells come out of integrating it.** Not either/or.
+## 1. The idea in six lines
 
 ```
-x0  ~ control cells of a context            (independent coupling — no pairing)
+x0  ~ control cells of a context           # independent coupling — no pairing
 x1  ~ perturbed cells, same context, target gene p
 t   ~ U(0,1)
-x_t = (1-t)·x0 + t·x1
-u   = x1 - x0
+x_t = (1-t)·x0 + t·x1                      # straight-line interpolant
+u   = x1 - x0                              # its velocity
 loss = masked MSE( v_θ(x_t, t | p, s(x0), ctx),  u )
 ```
 
-Inference: start at a **real control cell**, Euler-integrate `t: 0→1`. The
-endpoint is a predicted perturbed cell in lognorm space; `flow.to_counts`
-takes it back to UMIs using the source cell's library size.
+**Inference:** start at a *real control cell*, Euler-integrate `t: 0→1`. The
+endpoint is a predicted perturbed cell in lognorm space.
 
-**Why the loss is on the velocity and not on `x1` directly.** Regressing `x1`
-gives you the conditional *mean* — one point per perturbation, cell-to-cell
-heterogeneity gone. Under the flow-matching loss the optimum is
-`v*(x_t,t,c) = E[x1 - x0 | x_t, c]`, and integrating that field transports the
-*whole* control distribution onto the *whole* perturbed distribution. The
-spread comes out for free, which is exactly what the VCC-style distributional
-metrics score.
+So the model's **output is a velocity field**; the **deliverable is cells**.
 
-It also makes your `direction × magnitude` factorisation a one-line change:
+### Why the loss is on the velocity, not on `x1`
+
+Regressing `x1` directly gives you the conditional *mean* — one point per
+perturbation, cell-to-cell heterogeneity gone. Under the flow-matching loss
+the optimum is `v*(x_t,t,c) = E[x1 - x0 | x_t, c]`, and integrating that field
+transports the **whole** control distribution onto the **whole** perturbed
+distribution. The spread comes out for free — which is what the VCC-style
+distributional metrics actually score.
+
+It also makes the direction × magnitude factorisation a config flag:
 `model.head: dirmag` gives `v = softplus(m)·normalize(d)`.
 
 ### How other methods do it
@@ -50,72 +58,57 @@ It also makes your `direction × magnitude` factorisation a one-line change:
 | CellFlow / OT-CFM family | velocity field, ODE integrate | flow-matching MSE on velocity |
 | STATE (Arc, VCC25) | perturbed *set* from control *set* | MSE + distributional (energy/MMD) |
 
-The first row collapses each perturbation to a point. That is the thing to
-avoid, and the reason for choosing flow matching here.
+The first row collapses each perturbation to a point. That is the thing being
+avoided here.
 
 ---
 
-## Two corrections to the original spec
+## 2. Two index spaces, kept apart (`vocab.py`)
 
-**1. `selected_genes.csv` is not the perturbation vocabulary.** It is the
-*readout* panel (1,213 unique genes = 300 HVG + 200 random per dataset). Only
-**4 of the 80** prototype perturbations appear in it. The perturbation
-vocabulary is `data/VCC26/controls/gene_names.csv` (18,533 symbols), which
-covers all 80. Two separate index spaces, kept apart in `vocab.py`:
+| | Space | Size | Source |
+|---|---|---|---|
+| `GeneVocab` | **readout** — what we predict expression for | 18,533 | `data/VCC26/controls/gene_names.csv` |
+| `PertVocab` | **perturbation** — what can be knocked out, index 0 = `non-targeting` | 18,534 | same file, + the control slot |
 
-- `GeneVocab` — readout space, what we predict expression for
-- `PertVocab` — perturbation space, index 0 reserved for `non-targeting`
+Same csv, two different roles. They must stay separate: `selected_genes.csv`
+is the *readout* panel (300 HVG + 200 random per dataset, 1,213 unique), and
+only **4 of the 80** prototype perturbations appear in it. The perturbation
+vocabulary has to be the full symbol list or most knockouts are unrepresentable.
 
-**2. No perturbation is shared between any two of the eight files.** 10 each,
-80 unique, zero overlap. With a one-hot encoder a held-out perturbation keeps
-its random-init embedding row, so generalisation to unseen perturbations is
-impossible — not poor, *absent*. Splits are therefore on **cells**, stratified
-by perturbation. Swapping `PertEncoder` for a feature-based one (control
-expression profile of the knocked-out gene / OmniPath / DepMap) is the single
-change that unlocks unseen perturbations.
+Swapping either later = point `data.gene_vocab_csv` / `data.pert_vocab_csv` at
+a different csv. A one-column file, or one with a `gene_name`/`gene`/`symbol`
+column, both work (`vocab.py:30`).
 
 ---
 
-## Masking
+## 3. Preprocessing (`data/prepare.py`)
 
-Each context has its own gene panel (630–1,147 genes here, union 1,213). An
-unmeasured gene is **not** a gene measured as zero, and the model is told
-which is which. The mask enters in three places:
+`.h5ad` → one compact `.npz` per context. Reads `.layers["lognorm"]`
+(CPM + log1p) as the model space and `.X` (raw UMIs) for library size.
 
-1. input is `[x_t · mask, mask]` — the model sees the panel explicitly;
-2. output is multiplied by the mask — the field never moves in directions the
-   data cannot speak to;
-3. the loss averages over **measured entries only** — never `mean()` over `G`,
-   or loss magnitudes stop being comparable across contexts.
+**Nothing is zero-padded on disk.** Each context keeps its own compact matrix
+(630–1,147 columns) plus `gene_idx`, the map from local column → global
+readout index. The scatter into the 18,533-wide space happens per batch. That
+is what keeps this workable as the panel grows.
 
-Nothing is zero-padded on disk. Each context stores a compact matrix plus
-`gene_idx` (local column → global readout index); the scatter happens per
-batch. That is what keeps this workable at 18,533 genes — verified: prep and
-training both run unchanged with `gene_vocab_csv` pointed at the VCC26 list
-(31.6M params, 15 s/epoch on MPS).
+### Cell state — dumb on purpose (`prepare.py:55`)
 
----
-
-## Cell-state conditioning
-
-Dumb on purpose: **32 PCs + 3 scalars = 35 dims**, precomputed in `prepare.py`.
+35 dims = **32 PCs + 3 scalars**:
 
 - PCA fit on that context's **control cells only** — at inference we only ever
-  start from a control, so that is the distribution the basis must cover
+  start a trajectory from a control, so that is the distribution the basis has
+  to cover
 - scalars: `log1p(total UMI)`, `log1p(genes detected)`, `mean lognorm`
 - z-scored against control-cell statistics
+- `pca_components` / `pca_mean` / `state_mu` / `state_sd` are saved so new
+  cells can be projected the same way
 
-Conditioning always comes from the **source** cell `x0`. `x1`'s state must
-never leak in — at inference it does not exist.
+### Splits (`prepare.py:93`)
 
-This basis is context-local, which is fine for v0 because the model also gets
-a context embedding. A shared cross-context encoder (or scFoundation /
-scBaseCount coordinates) is the v1 upgrade; `StateEncoder`'s interface does
-not change.
+80/10/10 **on cells**, stratified by perturbation. *Not* on perturbations —
+see §6.
 
----
-
-## Data structure
+### What lands on disk
 
 ```
 data/processed/prototype/
@@ -131,73 +124,173 @@ data/processed/prototype/
       state         f32   [n_cells, 35]   cell-state conditioning
       lib           f32   [n_cells]       total UMI (from raw .X)
       control_rows  int32 [n_control]
-      pca_components / pca_mean / state_mu / state_sd   (project new cells)
+      pca_components / pca_mean / state_mu / state_sd
 ```
 
-Control cells appear as targets too, with pert index 0, so the model learns
-that "non-targeting" means near-zero net displacement — with the real
-control-to-control spread still in it. Without that anchor nothing pins the
-magnitude scale.
-
-`ContextBatchSampler` draws each batch from a single context (cheap scatter,
-one shared mask), shuffling context order every epoch.
+8 contexts, 31,210 cells, 35 MB.
 
 ---
 
-## Results, prototype subset (40 epochs, ~2.6 s/epoch on MPS)
+## 4. Masking — the part that makes heterogeneous panels work
 
-Test split, 70 perturbations, 8 contexts. `delta_r` = Pearson r between
-predicted and true mean shift from the control mean — the headline number,
-because plain expression correlation sits near 1.0 for everything including
-`identity` and tells you nothing.
+An unmeasured gene is **not** a gene measured as zero, and the model is told
+which is which. `FlowDataset` builds `gene_mask [n_contexts, n_genes]`
+(`dataset.py:76`) and it enters in **three** places:
+
+| Where | Code | Why |
+|---|---|---|
+| input | `torch.cat([x_t * m, m], -1)` — `velocity.py:125` | the model sees the panel explicitly, so zero-because-unmeasured ≠ zero-because-silent |
+| output | `return v * m` — `velocity.py:136` | the field never moves in directions the data cannot speak to |
+| loss | `((v-u)²·m).sum() / m.sum()` — `flow.py:60` | **never `mean()` over G** — contexts measure different gene counts, and an unmasked mean makes their losses incomparable |
+
+---
+
+## 5. Batching (`data/dataset.py`)
+
+A training item is one **perturbed cell** `x1`. Its partner `x0` is a control
+cell drawn at random from the same context — independent coupling.
+
+Two things that are easy to get wrong and are handled explicitly:
+
+- **Conditioning always comes from the source cell `x0`** (`dataset.py:135`).
+  `x1`'s state must never leak in; at inference it does not exist.
+- **Control cells appear as targets too**, with pert index 0. The model learns
+  that `non-targeting` means near-zero net displacement, with the real
+  control-to-control spread still in it. Without that anchor nothing pins the
+  magnitude scale.
+
+`ContextBatchSampler` (`dataset.py:143`) draws each batch from a single
+context — cheap scatter, one shared mask — and shuffles context order every
+epoch so the gradient doesn't walk through datasets in blocks.
+
+A batch is `{x0, x1, pert, ctx, state, lib0}`.
+
+---
+
+## 6. Model (`models/velocity.py`, `models/encoders.py`)
+
+```
+                 pert  ──► PertEncoder    (nn.Embedding, 64)   ─┐
+                 state ──► StateEncoder   (2-layer MLP, 64)     ├─► cond (192)
+                 ctx   ──► ContextEncoder (nn.Embedding, 32)    │
+                 t     ──► TimeEncoder    (Fourier, 32)        ─┘
+                                                                 │  (additive)
+  [x_t·m, m] ──► Linear(2G→512) ──► 3× pre-norm ResBlock ──► LayerNorm ──► head ──► ·m
+```
+
+31.6M params at G=18,533. Output layer is zero-initialised, so the model
+starts as the identity map (predict no change) and has to earn every
+deviation.
+
+**`PertEncoder` is one-hot.** `nn.Embedding(V, d)` is exactly `one_hot(p) @ W`,
+without materialising the V-wide row. The control slot is initialised to
+exactly zero.
+
+> **The limit, stated plainly.** A one-hot encoder has one free row per
+> perturbation, learned only from cells carrying it. A perturbation never seen
+> in training keeps its random init — so this model cannot generalise to
+> unseen perturbations. Not badly: *at all*. In the prototype data **no
+> perturbation is shared between any two of the eight files** (10 each, 80
+> unique, zero overlap), so a held-out-perturbation split would score pure
+> noise. That is why splits are on cells.
+
+Heads (`velocity.py:41`): `plain` (free vector, default) or `dirmag`
+(`v = softplus(m)·normalize(d)`).
+
+---
+
+## 7. Evaluation (`evaluate.py`)
+
+Three methods, always compared:
+
+| | |
+|---|---|
+| `identity` | predict no change, `x1_hat = x0`. The floor. |
+| `mean_shift` | `x1_hat = x0 + ` mean δ of that (context, pert) on the **train** split. Deliberately strong — it is handed the answer's first moment. |
+| `flow` | Euler-integrate the learned field from `x0`. |
+
+Three metrics, per (context, perturbation), over that context's panel genes:
+
+- **`delta_r`** — Pearson r between predicted and true mean shift from the
+  control mean. **The headline number.** Plain expression correlation sits
+  near 1.0 for everything including `identity`, and tells you nothing.
+- **`mae`** — mean |predicted mean − true mean| per gene.
+- **`energy`** — energy distance between predicted and true cell clouds,
+  `2E|X−Y| − E|X−X'| − E|Y−Y'|`. Zero iff the distributions match. This is the
+  one that punishes collapsing to a point, and the reason for a flow rather
+  than a regressor.
+
+`mean_shift` is in the harness because most published gains in this field
+evaporate against it.
+
+---
+
+## 8. Where it stands
+
+**Smoke run only — 2 epochs, not a trained model.** Test split, 70
+perturbations, 8 contexts:
 
 | method | delta_r (mean) | MAE | energy |
 |---|---|---|---|
 | identity (no change) | 0.036 | 0.733 | 16.87 |
-| **flow (this model)** | **0.122** | **0.719** | **16.41** |
+| **flow (2 epochs)** | **0.064** | 0.731 | 16.77 |
 | mean_shift baseline | 0.267 | 0.710 | 16.18 |
 
-**Read this honestly: the flow beats the do-nothing floor by ~3×, and loses to
-the mean-shift baseline.** `mean_shift` is handed the per-perturbation first
-moment from the train split, so it is a hard baseline by construction — and
-most published gains in this field evaporate against it, which is why it is in
-the harness. With ~25k cells, 500 readout genes per context and as few as 5
-test cells per perturbation, v0 losing here is the expected starting point,
-not a bug. The scaffolding is the deliverable; this row is the number to beat.
+For reference, an earlier **40-epoch** run on the smaller 1,213-gene readout
+space reached `delta_r = 0.122` — still below `mean_shift`. Treat both as
+"the pipeline runs end to end", not as model quality. Nothing here has been
+trained to convergence.
 
-Two diagnosable v0 symptoms already visible:
+Two symptoms already visible and worth watching:
 
-- controls move too much (energy 2.42 vs 1.31 for identity) — the model is not
-  fully respecting the "non-targeting = no motion" anchor
-- `frac_var_explained` plateaus near 9% — most of `x1 - x0` is irreducible
-  cell-to-cell noise, so this is not directly alarming, but it does mean the
-  signal is thin at this data scale
+- **Controls move too much** (energy 1.97 vs 1.31 for identity) — the
+  `non-targeting = no motion` anchor is not being fully respected.
+- **`frac_var_explained` plateaus around 4–9%** — most of `x1 − x0` is
+  irreducible cell-to-cell noise, so this is not directly alarming, but the
+  systematic signal is thin at this data scale.
+
+Also note: with the full 18,533-gene readout space, **17,320 output slots are
+measured by no dataset in the prototype**, so those rows never receive
+gradient (~8.9M of 31.6M params are dead). Harmless, and the price of
+checkpoint compatibility when richer datasets arrive. Set
+`gene_vocab_csv: null` to fall back to the union of the per-file panels
+(1,213 genes, 4.9M params, ~2.6 s/epoch) when iterating fast.
 
 ---
 
-## Upgrade order (highest leverage first)
+## 9. How to continue — highest leverage first
 
 1. **`PertEncoder` → feature-based.** The only change that makes unseen
-   perturbations possible at all. Everything else is refinement.
+   perturbations possible *at all*. Project features of the knocked-out gene:
+   its own expression profile across control cells, an OmniPath/STRING network
+   embedding, a DepMap essentiality vector. Same output shape — nothing
+   downstream changes. Do this first; everything else is refinement.
 2. **Add a distributional term to the loss** (energy / MMD on integrated
    endpoints, as STATE does). The current loss is pointwise; the metric is not.
 3. **OT coupling instead of independent coupling** — pair `x0`/`x1` by
-   minibatch OT. Straighter paths, fewer integration steps, lower variance.
+   minibatch optimal transport. Straighter paths, fewer integration steps,
+   lower gradient variance.
 4. **`StateEncoder` → shared across contexts**, so cell states are comparable
-   between cell lines and a new line is representable.
-5. **`head: dirmag`** — direction × magnitude, already wired.
-6. **Library-size modelling.** `to_counts` currently reuses the source cell's
-   depth; perturbations shift it.
+   between cell lines and a *new* line is representable. Currently the PCA
+   basis is context-local, which the context embedding papers over.
+5. **`head: dirmag`** — direction × magnitude, already wired, one config flag.
+6. **Library-size modelling.** `flow.to_counts` reuses the source cell's depth;
+   perturbations shift it.
 
-## Files
+Then scale the data: the prototype is 29k cells over 8 files, which is thin
+for 80 perturbations.
 
-| File | What it holds |
-|---|---|
-| `vocab.py` | the two index spaces |
-| `data/prepare.py` | h5ad → per-context npz, PCA, splits |
-| `data/dataset.py` | pairing, gene scatter, mask, context sampler |
-| `models/encoders.py` | pert / state / context / time encoders + upgrade notes |
-| `models/velocity.py` | the field, both heads |
-| `flow.py` | CFM loss, Euler sampler, lognorm→counts |
-| `train.py` | loop |
-| `evaluate.py` | metrics + `identity` / `mean_shift` baselines |
+---
+
+## 10. File map
+
+| File | Lines | What it holds |
+|---|---|---|
+| `vocab.py` | 106 | the two index spaces |
+| `data/prepare.py` | 252 | h5ad → per-context npz, PCA, splits |
+| `data/dataset.py` | 187 | pairing, gene scatter, mask, context sampler |
+| `models/encoders.py` | 112 | pert / state / context / time encoders + upgrade notes |
+| `models/velocity.py` | 136 | the field, both heads |
+| `flow.py` | 109 | CFM loss, Euler sampler, lognorm→counts |
+| `train.py` | 157 | loop, AdamW + cosine, checkpointing |
+| `evaluate.py` | 178 | metrics + `identity` / `mean_shift` baselines |

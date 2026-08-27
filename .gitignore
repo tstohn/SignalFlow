@@ -1,0 +1,67 @@
+# ---------------------------------------------------------------------------
+# SignalFlow
+#
+# What SHOULD be in the repo: signalflow/, configs/, pyproject.toml, uv.lock.
+# Everything below is either large, generated, machine-local, or notes.
+# ---------------------------------------------------------------------------
+
+# --- environment (1.1 GB; uv.lock is what's reproducible, not .venv) --------
+/.venv/
+/venv/
+.env
+.python-version
+
+# --- data (1.7 GB of h5ad; lives on the cluster / source archives) ----------
+/data/
+
+# --- training output (249 MB of checkpoints, eval csvs, histories) ----------
+/runs/
+wandb/
+lightning_logs/
+*.ckpt
+
+# --- generated figures and reports -----------------------------------------
+/figures/
+/information/
+
+# --- lab notes, not code ---------------------------------------------------
+/Zettlr_SignalFlow/
+
+# Exploratory UMAP/analysis scripts, excluded on request.
+# These ARE source (umap_*.py, ~36 KB) -- delete this line to track them.
+/scripts/
+
+# --- python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- stray data / model artefacts anywhere in the tree ---------------------
+# Belt and braces: keeps a checkpoint or matrix dropped outside data/ or runs/
+# from being committed by accident.
+*.h5ad
+*.h5
+*.npz
+*.npy
+*.pt
+*.pth
+*.zarr/
+
+# --- R ---------------------------------------------------------------------
+.Rhistory
+.RData
+.Rproj.user/
+
+# --- editors and OS --------------------------------------------------------
+.DS_Store
+._*
+.vscode/
+.idea/
+*.swp
+*~
