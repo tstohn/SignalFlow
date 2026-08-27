@@ -1,0 +1,43 @@
+# SignalFlow v0 -- conditional flow matching on the Prototype subset.
+seed: 0
+
+data:
+  source_dir: data/Prototype
+  glob: "*.h5ad"
+  processed_dir: data/processed/prototype
+  layer: lognorm                # CPM + log1p, as written by the subset script
+
+  # READOUT space (what we predict expression for): the FULL VCC26 panel.
+  # Every cell lives in all 18,533 gene slots; the ones its dataset never
+  # measured are masked out of the input, the output velocity and the loss.
+  # Set to null to shrink it back to the union of the per-file .var_names
+  # (1213 here) -- faster, but checkpoints stop being reusable the moment a
+  # new dataset brings genes the union did not have.
+  gene_vocab_csv: data/VCC26/controls/gene_names.csv
+
+  # PERTURBATION space (what can be knocked out). NOT the readout panel --
+  # only 4 of the 80 prototype perturbations appear in selected_genes.csv,
+  # so the pert vocab has to be the full symbol list.
+  pert_vocab_csv: data/VCC26/controls/gene_names.csv
+
+  n_pcs: 32                     # cell-state = 32 PCs + 3 scalars = 35 dims
+  split_fracs: [0.8, 0.1, 0.1]  # on CELLS, stratified by perturbation
+
+model:
+  hidden: 512
+  n_blocks: 3
+  pert_dim: 64
+  state_dim: 64
+  ctx_dim: 32
+  time_dim: 32
+  dropout: 0.0
+  head: plain                   # "plain" | "dirmag" (direction x magnitude)
+
+train:
+  device: auto                  # cuda -> mps -> cpu
+  epochs: 40
+  batch_size: 256
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  sigma: 0.0                    # noise around the interpolant; 0 = rectified
+  out_dir: runs/prototype
