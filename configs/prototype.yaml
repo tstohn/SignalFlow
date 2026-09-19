@@ -21,23 +21,49 @@ data:
   pert_vocab_csv: data/VCC26/controls/gene_names.csv
 
   n_pcs: 32                     # cell-state = 32 PCs + 3 scalars = 35 dims
-  split_fracs: [0.8, 0.1, 0.1]  # on CELLS, stratified by perturbation
+                                # (the basis is fit per RUN, on the training lines only)
 
 model:
   hidden: 512
   n_blocks: 3
   pert_dim: 64
   state_dim: 64
-  ctx_dim: 32
   time_dim: 32
   dropout: 0.0
   head: plain                   # "plain" | "dirmag" (direction x magnitude)
 
 train:
   device: auto                  # cuda -> mps -> cpu
-  epochs: 40
+
+  # ---- which cell lines train, and which are held out ----------------------
+  mode: holdout                 # holdout | crossval | full   (--mode overrides)
+  holdout: VCC25__adata_Test    # holdout mode: the ONE cell line kept out as validation
+  # crossval_lines: []          # crossval: which lines to hold out in turn (default: all)
+
+  # ---- how long ------------------------------------------------------------
+  epochs: 5                     # the MAXIMUM (early stopping may stop sooner).
+                                # In `full` mode it is the EXACT count: use what crossval recommends.
+
+  # ---- when to stop early (holdout / crossval only) -------------------------
+  early_stop_metric: vcc        # vcc = the cell-eval average on the held-out line (what the
+                                # challenge scores; needs cell_eval_every > 0)
+                                # val_loss = the flow-matching loss on the held-out line (cheap,
+                                # every epoch, but only a proxy). The TRAINING loss is never an
+                                # option: it falls whether or not the model generalises.
+  early_stop_patience: 0        # plateau stop: N measurements in a row without progress; 0 = never
+  early_stop_window: 1          # smooth the score over the last W measurements before comparing
+  early_stop_min_delta: 0.0     # progress = the smoothed score beats the best by at least this
+
+  # ---- cell-eval on the held-out line ---------------------------------------
+  cell_eval_every: 5            # score every N epochs, and always at the last; 0 = off
+                                # (~15-25 s per scoring here, more on bigger data)
+  cell_eval_steps: 20           # Euler steps when integrating for the score
+  cell_eval_min_cells: 5        # skip a (line, perturbation) group with fewer cells than this
+
+  # ---- optimisation ---------------------------------------------------------
   batch_size: 256
   lr: 1.0e-3
   weight_decay: 1.0e-4
   sigma: 0.0                    # noise around the interpolant; 0 = rectified
-  out_dir: runs/prototype
+
+  out_dir: runs/prototype       # runs land in <out_dir>/holdout_<line>/, /crossval/, /full/

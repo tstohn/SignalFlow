@@ -6,7 +6,7 @@ TRAINING (one step)
     t  ~ U(0, 1)
     x_t = (1 - t) x0 + t x1                (+ optional sigma * noise)
     u   = x1 - x0                          (velocity of the straight path)
-    loss = masked MSE( v_theta(x_t, t | p, s(x0), ctx),  u )
+    loss = masked MSE( v_theta(x_t, t | p, s(x0), mask),  u )
 
 WHY THE LOSS IS ON THE VELOCITY, NOT ON x1
     Regressing x1 directly gives the conditional *mean* -- one point per
@@ -29,9 +29,23 @@ would make loss magnitudes incomparable across them.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 
-from .models.velocity import VelocityField
+from .velocity import VelocityField
+
+
+def mask_from_gene_idx(gene_idx: np.ndarray, n_genes: int, batch_size: int) -> torch.Tensor:
+    """A [batch_size, n_genes] mask, 1 at `gene_idx`, repeated over cells.
+
+    Every cell drawn from one context shares one gene panel, so this is the
+    same row broadcast -- the thing every inference call needs and used to get
+    via a lookup on a trained context id. Building it here from the caller's
+    own `gene_idx` is what makes that lookup unnecessary.
+    """
+    row = np.zeros(n_genes, dtype=np.float32)
+    row[gene_idx] = 1.0
+    return torch.from_numpy(np.tile(row, (batch_size, 1)))
 
 
 def cfm_loss(
@@ -40,9 +54,8 @@ def cfm_loss(
     sigma: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     x0, x1 = batch["x0"], batch["x1"]
-    pert, ctx, state = batch["pert"], batch["ctx"], batch["state"]
+    pert, m, state = batch["pert"], batch["mask"], batch["state"]
 
-    m = model.mask_for(ctx)
     t = torch.rand(x0.shape[0], device=x0.device)
 
     x_t = (1.0 - t)[:, None] * x0 + t[:, None] * x1
@@ -53,7 +66,7 @@ def cfm_loss(
         x_t = x_t + sigma * torch.randn_like(x_t) * m
 
     u = (x1 - x0) * m
-    v = model(x_t, t, pert, state, ctx)
+    v = model(x_t, t, pert, state, m)
 
     denom = m.sum().clamp_min(1.0)
     loss = (((v - u) ** 2) * m).sum() / denom
@@ -74,7 +87,7 @@ def integrate(
     x0: torch.Tensor,
     pert: torch.Tensor,
     state: torch.Tensor,
-    ctx: torch.Tensor,
+    mask: torch.Tensor,
     n_steps: int = 20,
     clamp_min: float | None = 0.0,
 ) -> torch.Tensor:
@@ -82,12 +95,12 @@ def integrate(
     was_training = model.training
     model.eval()
 
-    m = model.mask_for(ctx)
+    m = mask
     x = x0 * m
     dt = 1.0 / n_steps
     for i in range(n_steps):
         t = torch.full((x.shape[0],), i * dt, device=x.device)
-        x = x + dt * model(x, t, pert, state, ctx)
+        x = x + dt * model(x, t, pert, state, m)
         if clamp_min is not None:
             # lognorm = log1p(CPM) is non-negative by construction
             x = x.clamp_min(clamp_min) * m

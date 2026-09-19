@@ -7,11 +7,19 @@ that "non-targeting" means near-zero net displacement (with the real
 control-to-control spread still in it). That anchor matters: without it
 nothing pins the magnitude scale.
 
+WHICH CELLS GO WHERE IS NOT DECIDED HERE
+    A `FlowDataset` is built from a list of contexts and uses ALL of their cells.
+    There is no train/val/test split of cells: `training/train.py` decides which
+    whole cell lines are training data and which (if any) is held out, per run.
+
 Genes: each context stores a compact matrix plus `gene_idx`. Batches scatter
-into the global readout space here, and carry the context id; the boolean
-`gene_mask` [n_contexts, n_genes] tells the model and the loss which entries
-are measurements and which are structural zeros. That distinction is the whole
-reason for masking -- an unmeasured gene is not a gene measured as zero.
+into the global readout space here, and each batch carries its own `mask`
+tensor built from that scatter -- which entries are measurements and which are
+structural zeros. That distinction is the whole reason for masking -- an
+unmeasured gene is not a gene measured as zero -- and the model receives it
+directly per call, never by looking up a trained context id (see
+models/velocity.py, models/encoders.py). `ctx` is also carried in each batch,
+but only for per-source-dataset reporting; the model never sees it.
 """
 
 from __future__ import annotations
@@ -26,10 +34,15 @@ from torch.utils.data import Dataset, Sampler
 
 
 class ContextStore:
-    """One context's arrays, held in memory."""
+    """One context's arrays, held in memory. `state` is attached by `data/state.py`."""
 
     def __init__(self, path: Path, index: int, name: str) -> None:
         z = np.load(path)
+        if "scalars" not in z.files:
+            raise SystemExit(
+                f"{path}: written by an older `prepare` (no `scalars`). The processed format "
+                f"changed -- re-run `python -m signalflow.data.prepare --config <config>`."
+            )
         self.index, self.name = index, name
         self.X = sp.csr_matrix(
             (z["X_data"], z["X_indices"], z["X_indptr"]), shape=tuple(z["X_shape"])
@@ -37,55 +50,58 @@ class ContextStore:
         self.gene_idx = z["gene_idx"]
         self.pert = z["pert"]
         self.is_control = z["is_control"]
-        self.state = z["state"]
         self.lib = z["lib"]
+        self.scalars = z["scalars"]
         self.control_rows = z["control_rows"]
+        self.state: np.ndarray | None = None
 
     def dense(self, rows: np.ndarray) -> np.ndarray:
         return np.asarray(self.X[rows].todense(), dtype=np.float32)
 
 
+def load_contexts(processed_dir: str | Path) -> tuple[dict, list[ContextStore]]:
+    """meta.json and every context of a processed directory, without any state yet."""
+    d = Path(processed_dir)
+    meta = json.loads((d / "meta.json").read_text())
+    stores = [ContextStore(d / c["file"], c["index"], c["name"]) for c in meta["contexts"]]
+    return meta, stores
+
+
 class FlowDataset(Dataset):
     def __init__(
         self,
-        processed_dir: str | Path,
-        split: str = "train",
-        control_split: str | None = None,
+        contexts: list[ContextStore],
+        n_genes: int,
+        n_perts: int,
         seed: int = 0,
+        keep_perts: np.ndarray | None = None,
     ) -> None:
-        d = Path(processed_dir)
-        self.meta = json.loads((d / "meta.json").read_text())
-        splits = json.loads((d / "splits.json").read_text())
+        """`contexts` must already have `.state` (see `data/state.py`).
 
-        self.n_genes = int(self.meta["n_genes"])
-        self.n_perts = int(self.meta["n_perts"])
-        self.n_state = int(self.meta["n_state"])
-        self.split = split
+        `keep_perts`, if given, restricts the TARGET cells to those whose perturbation
+        is in it (controls are always kept). The source-control pool is never
+        restricted: a flow always starts from a control cell of the same context.
+        """
+        if not contexts:
+            raise ValueError("a FlowDataset needs at least one context")
+        if any(c.state is None for c in contexts):
+            raise ValueError("every context needs .state; call data.state.attach_state first")
+
+        self.contexts = contexts
+        self.n_genes, self.n_perts = int(n_genes), int(n_perts)
+        self.n_state = int(contexts[0].state.shape[1])
+        self.n_contexts = len(contexts)
         self.rng = np.random.default_rng(seed)
 
-        self.contexts: list[ContextStore] = [
-            ContextStore(d / c["file"], c["index"], c["name"])
-            for c in self.meta["contexts"]
-        ]
-        self.n_contexts = len(self.contexts)
-
-        self.gene_mask = np.zeros((self.n_contexts, self.n_genes), dtype=bool)
-        for c in self.contexts:
-            self.gene_mask[c.index, c.gene_idx] = True
-
-        # target rows for this split, and the pool of control cells allowed as
-        # flow sources. Sourcing from the same split keeps evaluation honest.
-        cs = control_split or split
+        keep = None if keep_perts is None else np.union1d(np.asarray(keep_perts, dtype=np.int64), [0])
         self.rows: list[np.ndarray] = []
         self.control_pool: list[np.ndarray] = []
-        for c in self.contexts:
-            sel = np.array(splits[c.name][split], dtype=np.int64)
+        for c in contexts:
+            sel = np.arange(c.X.shape[0], dtype=np.int64)
+            if keep is not None:
+                sel = sel[np.isin(c.pert, keep)]
             self.rows.append(sel)
-            pool_all = np.array(splits[c.name][cs], dtype=np.int64)
-            pool = pool_all[c.is_control[pool_all]]
-            if pool.size == 0:  # tiny split -> fall back to all controls
-                pool = c.control_rows.astype(np.int64)
-            self.control_pool.append(pool)
+            self.control_pool.append(c.control_rows.astype(np.int64))
 
         self.items = np.concatenate(
             [
@@ -110,6 +126,7 @@ class FlowDataset(Dataset):
 
         x0 = np.zeros((B, G), dtype=np.float32)
         x1 = np.zeros((B, G), dtype=np.float32)
+        mask = np.zeros((B, G), dtype=np.float32)
         state = np.zeros((B, self.n_state), dtype=np.float32)
         lib0 = np.zeros(B, dtype=np.float32)
 
@@ -121,6 +138,9 @@ class FlowDataset(Dataset):
             # np.ix_ scatters the compact columns into the global gene space
             x1[np.ix_(sel, c.gene_idx)] = c.dense(tgt)
             x0[np.ix_(sel, c.gene_idx)] = c.dense(src)
+            # which genes THIS context measures -- an argument to the model,
+            # never a lookup by context identity (see models/velocity.py)
+            mask[np.ix_(sel, c.gene_idx)] = 1.0
             # conditioning always comes from the SOURCE cell: at inference we
             # only ever have controls, so x1's state must never leak in here.
             state[sel] = c.state[src]
@@ -134,6 +154,8 @@ class FlowDataset(Dataset):
             "x0": torch.from_numpy(x0),
             "x1": torch.from_numpy(x1),
             "pert": torch.from_numpy(pert),
+            "mask": torch.from_numpy(mask),
+            # bookkeeping only -- which source context each row came from. NOT a model input.
             "ctx": torch.from_numpy(ctx_ids),
             "state": torch.from_numpy(state),
             "lib0": torch.from_numpy(lib0),

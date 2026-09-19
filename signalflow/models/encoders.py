@@ -6,6 +6,17 @@ The three things the velocity field is conditioned on:
   StateEncoder    what kind of cell we started from
   time features   where along the flow we are
 
+There is deliberately no per-cell-line encoder here. A learned lookup keyed by
+"which dataset/cell line" cannot represent a cell line absent at training
+time -- exactly the shape of unmeasured-gene generalisation `PertEncoder`
+already cannot do, applied to cell lines instead of perturbations. Cell-line
+identity is meant to be entirely subsumed by `StateEncoder`'s input: the state
+vector now comes from ONE shared PCA basis (`data/shared_pca.py`), fit across every
+training context and reusable, unmodified, on a context that never existed at
+fit time. What genes a cell's context measures still matters -- but that enters
+as the `mask` argument to `VelocityField.forward`, a property of the DATA, not
+a trained embedding of the context's identity.
+
 Every one of these is the "obviously too simple" version on purpose. The
 upgrade paths are noted at each class -- they are meant to be swapped one at a
 time, keeping everything else fixed.
@@ -57,15 +68,15 @@ class PertEncoder(nn.Module):
 class StateEncoder(nn.Module):
     """Cell-state summary -> dense vector.
 
-    Input is the precomputed state vector from `data/prepare.py`: the top PCs
-    of the source cell (PCA fit on that context's control cells) plus three
-    scalars -- log total UMI, log genes detected, mean lognorm. That is the
-    whole "cell state" for v0.
+    Input is the precomputed state vector from `data/prepare.py`: the scores of
+    the source cell on ONE shared PCA basis (fit across every context's control
+    cells, `data/shared_pca.py`) plus three scalars -- log total UMI, log genes
+    detected, mean lognorm. That is the whole "cell state" for v0, and it is
+    already comparable between cell lines.
 
-    Upgrade path: a shared encoder fit across contexts (so states are
-    comparable between cell lines), or a pretrained embedding
-    (scFoundation/Geneformer), or scBaseCount-derived coordinates. Swap the
-    input, keep the interface.
+    Upgrade path: a pretrained embedding (scFoundation/Geneformer) or
+    scBaseCount-derived coordinates in place of the PCA. Swap the input, keep the
+    interface.
     """
 
     def __init__(self, n_state: int, dim: int = 64, hidden: int = 128) -> None:
@@ -77,23 +88,6 @@ class StateEncoder(nn.Module):
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         return self.net(state)
-
-
-class ContextEncoder(nn.Module):
-    """Which dataset/cell-line this cell came from. A plain lookup.
-
-    Upgrade path: replace with cell-line features (DepMap, baseline
-    expression) so a *new* cell line is representable.
-    """
-
-    def __init__(self, n_contexts: int, dim: int = 32) -> None:
-        super().__init__()
-        self.emb = nn.Embedding(n_contexts, dim)
-        nn.init.normal_(self.emb.weight, std=0.02)
-        self.out_dim = dim
-
-    def forward(self, ctx: torch.Tensor) -> torch.Tensor:
-        return self.emb(ctx)
 
 
 class TimeEncoder(nn.Module):

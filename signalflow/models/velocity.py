@@ -1,9 +1,17 @@
-"""The velocity field v_theta(x_t, t | pert, cell state, context).
+"""The velocity field v_theta(x_t, t | pert, cell state, mask).
 
 Output is a per-cell velocity vector in log-normalised gene space, one entry
-per readout gene, zeroed outside the context's gene panel. Integrating it from
-a real control cell gives the predicted perturbed cell -- so the model's
+per readout gene, zeroed outside the calling cell's gene panel. Integrating it
+from a real control cell gives the predicted perturbed cell -- so the model's
 *output* is a field and the *deliverable* is cells.
+
+`mask` is an ARGUMENT, not a lookup. There is no per-context identity anywhere
+in this model: earlier versions indexed a registered `gene_mask` buffer (and a
+learned `ContextEncoder`) by a trained context id, which meant a cell line
+absent from that buffer had no way to be scored at all. Passing the mask
+directly -- "which genes does THIS cell have" -- works for any data, whether
+or not its context existed when the model was trained. See `encoders.py` and
+`data/shared_pca.py` for the rest of that change.
 
 The gene mask enters in three places, and all three matter:
   1. the input is [x_t * mask, mask], so an unmeasured gene is distinguishable
@@ -19,7 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .encoders import ContextEncoder, PertEncoder, StateEncoder, TimeEncoder
+from .encoders import PertEncoder, StateEncoder, TimeEncoder
 
 
 class _ResBlock(nn.Module):
@@ -51,17 +59,14 @@ class VelocityField(nn.Module):
         self,
         n_genes: int,
         n_perts: int,
-        n_contexts: int,
         n_state: int,
         hidden: int = 512,
         n_blocks: int = 3,
         pert_dim: int = 64,
         state_dim: int = 64,
-        ctx_dim: int = 32,
         time_dim: int = 32,
         dropout: float = 0.0,
         head: str = "plain",
-        gene_mask: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.n_genes = n_genes
@@ -69,17 +74,8 @@ class VelocityField(nn.Module):
 
         self.pert_enc = PertEncoder(n_perts, pert_dim)
         self.state_enc = StateEncoder(n_state, state_dim)
-        self.ctx_enc = ContextEncoder(n_contexts, ctx_dim)
         self.time_enc = TimeEncoder(time_dim)
-        cond_dim = pert_dim + state_dim + ctx_dim + time_dim
-
-        # gene mask lives with the model so a checkpoint is self-contained
-        mask = (
-            torch.ones(n_contexts, n_genes)
-            if gene_mask is None
-            else torch.as_tensor(gene_mask, dtype=torch.float32)
-        )
-        self.register_buffer("gene_mask", mask)
+        cond_dim = pert_dim + state_dim + time_dim
 
         self.inp = nn.Linear(2 * n_genes, hidden)
         self.blocks = nn.ModuleList(
@@ -100,25 +96,21 @@ class VelocityField(nn.Module):
         else:
             raise ValueError(f"unknown head {head!r}")
 
-    def mask_for(self, ctx: torch.Tensor) -> torch.Tensor:
-        return self.gene_mask[ctx]
-
     def forward(
         self,
         x_t: torch.Tensor,     # [B, G]
         t: torch.Tensor,       # [B]
         pert: torch.Tensor,    # [B]
         state: torch.Tensor,   # [B, n_state]
-        ctx: torch.Tensor,     # [B]
+        mask: torch.Tensor,    # [B, G] -- which genes THIS cell's data has
     ) -> torch.Tensor:
-        m = self.mask_for(ctx)
+        m = mask
         h = self.inp(torch.cat([x_t * m, m], dim=-1))
 
         c = torch.cat(
             [
                 self.pert_enc(pert),
                 self.state_enc(state),
-                self.ctx_enc(ctx),
                 self.time_enc(t),
             ],
             dim=-1,
