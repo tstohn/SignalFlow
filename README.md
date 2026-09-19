@@ -1,4 +1,11 @@
-# SignalFlow v0 — conditional flow matching for perturbation response
+<table>
+  <tr>
+    <td><img src="images/LOGO_SIGNALFLOW.png" alt="SignalFlow logo" width="120"></td>
+    <td><h1>SignalFlow</h1></td>
+  </tr>
+</table>
+
+**v0 — conditional flow matching for perturbation response**
 
 Predicts what single cells look like after a CRISPR knockout, by learning a
 **velocity field** that transports control cells onto perturbed cells.
@@ -10,14 +17,15 @@ path written next to it.
 ```bash
 cd /Users/timstohn/Desktop/SignalFlow
 
-python -m signalflow.data.prepare --config configs/prototype.yaml   # ~40 s
-python -m signalflow.training.train        --config configs/prototype.yaml   # ~14 s/epoch (MPS)
-python -m signalflow.evaluation.evaluate     --config configs/prototype.yaml --split test
-python -m signalflow.evaluation.evaluate     --config configs/prototype.yaml --split test --vcc
+python -m signalflow.data.prepare   --config configs/prototype.yaml            # once per data change
+python -m signalflow.training.train --config configs/prototype.yaml --mode holdout
+python -m signalflow.training.train --config configs/prototype.yaml --mode crossval
+python -m signalflow.training.train --config configs/prototype.yaml --mode full     # epochs = train.full_epochs, from crossval
 ```
 
-The `Makefile` wraps these: `make training` (prepare → train → evaluate), `make prediction`,
-and `make submission` (package + upload in one call). `make -n <target>` previews without running.
+The `Makefile` wraps these: `make prepare`, `make holdout`, `make crossval`,
+`make train-full`, `make prediction`, `make submission`. `make -n <target>` previews
+without running.
 
 Everything is driven by `configs/prototype.yaml`. Run from the repo root
 (`signalflow/` is not installed as a package).
@@ -95,33 +103,17 @@ column, both work (`vocab.py:30`).
 readout index. The scatter into the 18,533-wide space happens per batch. That
 is what keeps this workable as the panel grows.
 
-### Cell state — one shared basis, not one per context (`shared_pca.py`, `prepare.py:63`)
+### What `prepare` does NOT do: split, or fit a PCA
 
-35 dims = **32 PCs + 3 scalars**:
+`prepare` only converts and aligns. Both the split (which whole cell lines train) and
+the shared PCA basis are decided **per run** by `training/train.py` — the basis has to
+be fit without any held-out line's control cells or the hold-out is not honest, and
+the cell state depends on that basis. See §7. Re-run `prepare` when you add or change
+a source file, not when you change a split.
 
-- The PCs come from **one PCA basis fit across every context's control
-  cells**, not a fresh fit per context. Fitting alternates two least-squares
-  solves (EM/ALS) over only the (cell, gene) pairs a context actually
-  measured — the same masking discipline as the flow-matching loss (§4),
-  applied to fitting a PCA instead of a velocity field. See `shared_pca.py`.
-- **Why shared, not per-context:** a per-context basis has no row for a
-  context absent at prep time — exactly the failure mode that made a
-  per-context `ContextEncoder` (removed, see §6) unusable on a held-out cell
-  line. The shared basis is frozen after `prepare.py` and reused unmodified:
-  embedding a NEW cell line is one small least-squares solve against it
-  (`shared_pca.project()`), needing no access to the training data.
-- scalars: `log1p(total UMI)`, `log1p(genes detected)`, `mean lognorm`
-- z-scored against **that context's own** control-cell statistics — this step
-  stays per-context; it's derivable from any dataset's own controls and
-  carries no training-time identity
-- `pca_shared.npz` (top-level, ONE file) holds `loadings`/`mu`; per-context
-  `state_mu`/`state_sd` no longer exist as separate files, they're folded into
-  `state` at prep time the same way they always were
-
-### Splits (`prepare.py:93`)
-
-80/10/10 **on cells**, stratified by perturbation. *Not* on perturbations —
-see §6.
+The three per-cell scalars of the state vector — `log1p(total UMI)`,
+`log1p(genes detected)` and `mean lognorm` — depend on no basis, so they are computed
+here once and stored.
 
 ### What lands on disk
 
@@ -161,7 +153,7 @@ enters in **three** places:
 | output | `return v * m` — `velocity.py` | the field never moves in directions the data cannot speak to |
 | loss | `((v-u)²·m).sum() / m.sum()` — `flow.py` | **never `mean()` over G** — contexts measure different gene counts, and an unmasked mean makes their losses incomparable |
 
-`evaluate.py`, `cell_eval.py` and `predict.py` all build this same mask directly
+`cell_eval.py` and `predict.py` both build this same mask directly
 from a context's `gene_idx` (`flow.mask_from_gene_idx`) rather than from any
 identity lookup — which is what makes them work on data whose context never
 appeared during training.
@@ -186,7 +178,7 @@ Two things that are easy to get wrong and are handled explicitly:
 context — cheap scatter, one shared mask — and shuffles context order every
 epoch so the gradient doesn't walk through datasets in blocks. `ctx` still
 rides along in every batch dict, but **only** as bookkeeping for per-source
-reporting in `evaluate.py`/`cell_eval.py` — the model itself never receives it.
+reporting in `cell_eval.py` — the model itself never receives it.
 
 A batch is `{x0, x1, pert, mask, state, lib0, ctx}`.
 
@@ -232,14 +224,14 @@ Heads (`velocity.py:41`): `plain` (free vector, default) or `dirmag`
 
 ---
 
-## 7. Evaluation (`evaluate.py`)
+## 7. Evaluation — on a held-out CELL LINE
 
 Three methods, always compared:
 
 | | |
 |---|---|
 | `identity` | predict no change, `x1_hat = x0`. The floor. |
-| `mean_shift` | `x1_hat = x0 + ` mean δ of that (context, pert) on the **train** split. Deliberately strong — it is handed the answer's first moment. |
+| `mean_shift` | `x1_hat = x0 + ` the mean δ of that perturbation in the **training** lines — "if I knew what this knockout does elsewhere". Deliberately strong. |
 | `flow` | Euler-integrate the learned field from `x0`. |
 
 Three metrics, per (context, perturbation), over that context's panel genes:
@@ -256,22 +248,71 @@ Three metrics, per (context, perturbation), over that context's panel genes:
 `mean_shift` is in the harness because most published gains in this field
 evaporate against it.
 
-### How the data is split, and what each part is used for
+### How the data is split: by CELL LINE, not by cell
 
-`prepare.py` splits **cells**, 80 / 10 / 10, stratified per (context,
-perturbation) — so every perturbation appears in all three parts (a one-hot
-`PertEncoder` cannot handle a held-out perturbation, §6). Every group keeps at
-least one training cell.
+There is no train/val/test split of cells, and `prepare` does no splitting at all.
+A whole cell line is either training data or held out, decided per run by
+the `--mode` flag (`make holdout` / `make crossval` / `make train-full`):
 
-| split | used by | for |
-|---|---|---|
-| `train` | `train.py` | the gradient updates |
-| `val` | `train.py`, each epoch | val loss (which picks `best.pt`) and, if `train.cell_eval_every` > 0, the cell-eval2 VCC26 metrics. Its source control cells come from a held-out val pool too, so the flow never starts from cells it memorised |
-| `test` | `evaluate.py` | one final look, after training |
+| mode | trains on | held out | stops when |
+|---|---|---|---|
+| `holdout` | every line but one | ONE line (`train.holdout`) | the plateau rule fires, or `max_epochs` |
+| `crossval` | every line but one, N times | each line in turn | per fold, as above |
+| `full` | **every** line | nothing | exactly `full_epochs` |
 
-One caveat: the shared PCA basis and each context's state z-scoring are fit on
-the control cells of *all three* splits. It is unsupervised and controls only,
-but val/test controls do influence the basis.
+`holdout` is for everyday model changes: one run, answering "does this change help on
+a line the model has never seen?". `crossval` trains one model per line, so it shows
+how much that answer varies between lines — a design only counts as better if it wins
+by more than that spread — and it recommends the epoch count for `full`. `full` is the
+final model: with nothing held out nothing can be measured, so it trains a fixed
+number of epochs and you keep `last.pt`.
+
+**The PCA basis is fit per run, not in `prepare`.** A held-out line must not be in the
+basis or it is not really unseen, so each run fits its own on its training lines only
+and writes `pca_shared.npz` **beside its checkpoints**. `predict.py` reads the basis
+from the checkpoint's own folder, so it always travels with the model it was fit for;
+`--checkpoint` is therefore required.
+
+**One caveat, and it is the important one.** A held-out line only tells you something
+if its perturbations also occur in the training lines — the model cannot know a
+perturbation it has never seen. Training restricts the held-out line to the
+perturbations the training lines carry, and warns loudly when that leaves nothing —
+exactly the case in the prototype data, whose 8 files share *no* perturbations, so its
+hold-out scores measure noise. With real data, check the overlap first.
+
+`--mode holdout --vcc25` (`make holdout-vcc25`) validates on all three `VCC25__*` lines together
+(they are held out as one set, scored per context and averaged); the flag replaces `train.holdout`
+for that run, and the run lands in `holdout_vcc25/`.
+
+### Run choices: one place, the config
+
+`train.holdout`, `max_epochs`, `full_epochs` and `early_stop.{metric,patience,window,min_delta}`
+are set in the config's `train:` block and nowhere else; the Makefile targets only pick the mode
+(`--mode`). Neither the Makefile nor the code has defaults for them, and a missing key is an
+error. Prototype values: `holdout: VCC25__adata_Test`, `max_epochs: 5`, `full_epochs: 5`,
+`metric: vcc`, `patience: 3`, `window: 3`, `min_delta: 0.005`. `full_epochs` comes from
+`make crossval`'s recommendation. To try another setting, copy the config (and change `out_dir`).
+
+### Early stopping: what to watch (`early_stop.metric`)
+
+| value | what it watches | measured | good for |
+|---|---|---|---|
+| `vcc` (default) | the cell-eval average on the held-out line | every `cell_eval_every` epochs | what the challenge actually scores |
+| `val_loss` | the flow-matching loss on the held-out line | every epoch | cheap and smooth, but only a proxy |
+
+The **training** loss is deliberately not an option: it falls every epoch whether or
+not the model generalises, so it cannot detect overfitting. It is used only as a guard
+— a non-finite training loss aborts the run. `max_epochs` is always the **maximum**
+(the exact count in `full` mode); early stopping only ever stops sooner.
+### TensorBoard
+
+`make tensorboard` serves the curves of every run under `train.out_dir` (open the printed URL).
+Each run writes to `<run>/tb/`: `loss/train`, `loss/val`, `loss/val_identity`,
+`val/frac_var_explained`, `train/lr`, and — on the epochs where cell-eval is scored —
+`cell_eval/avg_scaled` (with the `mean_shift` and `identity` baselines as reference lines),
+`cell_eval/avg_smooth` (what the plateau rule watches) and the six members under
+`cell_eval_scaled/` and `cell_eval_raw/`. Runs sit side by side, so comparing configs or
+crossval folds is one click. Logging is best-effort: without tensorboard the run still trains.
 
 ### Cell-eval metrics during training (`train.cell_eval_every`)
 
@@ -291,14 +332,23 @@ epoch   5  train 7.9032  val 7.7602  (identity 8.2235, explained   5.6%)  11.4s
     dir_fidelity     0.096   -0.808      8/8
     dir_reach        0.353   +0.353      8/8
     sig_jaccard      0.472   +0.472      8/8
-    lfc_nmae         1.137   -0.137      6/8
-    AVERAGE                  -0.032     (mean_shift +0.328)  best -0.032 at epoch 5
-```
+Runs land in `<out_dir>/holdout_<line>/`, `<out_dir>/crossval/fold_<line>/` or
+`<out_dir>/full/`, each holding:
 
-`raw` is each metric as cell-eval2 defines it (lower is better for `expr_mse` and
-`lfc_nmae`); `scaled` puts all six on one axis, 0 = no skill and 1 = perfect;
-`mean_shift` is the number to beat. `contexts` is how many of the val contexts a
-row averages over: a metric is missing in a context where the real data cannot
+| file | holds |
+|---|---|
+| `last.pt` | the most recent completed epoch — **the model to use after `full`** |
+| `best.pt` | lowest held-out **loss** (holdout / crossval) |
+| `best_vcc.pt` | highest held-out **cell-eval score** (holdout / crossval, cell-eval on) |
+| `pca_shared.npz` | the PCA basis this model was trained with — it belongs to the model |
+| `run.json` | mode, lines and perturbations trained on, epochs, best epoch and score |
+| `history.json` | every epoch's numbers |
+| `train.log` | everything printed, plus the detail and notices kept off the terminal |
+
+`crossval` also writes `crossval/summary.json` and prints a table: each line's best
+epoch and score, the mean and standard deviation across lines, and the **recommended
+epoch count** (the median best epoch) to pass to `full`. It warns when a fold was
+still improving at the maximum, which means `epochs` was too low to trust.
 support it (too few cells), which is also why AVERAGE — the mean over contexts of
 each context's average over the members it has — is not the plain mean of the six
 rows. At the start the two baselines are printed once, per member, and at the end
@@ -310,8 +360,7 @@ The repeated notices cell-eval2 prints, such as "de_lfc_nmae: omitted N
 perturbation(s) for an empty gate", are ordinary Python `logging` records: they
 mean the metric had nothing to score for those perturbations because too few real
 genes were significant (the val split has few cells per perturbation). They go to
-`train.log` (and, for `evaluate --vcc`, to `evaluate_vcc_<split>.log` beside the
-results) instead of the terminal. **cell-eval2 itself is never modified**: a
+`train.log` instead of the terminal. **cell-eval2 itself is never modified**: a
 handler is attached to its logger from our side (`evaluation/cell_eval.captured`)
 only while a scoring call runs, and removed afterwards.
 
@@ -328,18 +377,18 @@ epoch, so an interrupt costs at most the epoch in progress.
 
 The two "best" checkpoints need not agree — the loss is a proxy, the cell-eval
 score is what the challenge measures — so pass `--checkpoint runs/.../best_vcc.pt`
-to `predict.py` / `evaluate.py` to use the latter.
+to `predict.py` to use the latter.
 
 **Plateau stopping** (`training/stopping.py`). The cell-eval score is noisy, so
 "stop when it has not set a new maximum" is a poor rule: one lucky epoch sets a bar
 that may never be cleared again, and a wobble upward of 0.001 resets the clock.
-`train.early_stop_*` adds three things, all off by default (`early_stop_patience: 0`):
+The `early_stop` keys add three things (`patience: 0` turns stopping off):
 
 | key | meaning |
 |---|---|
-| `early_stop_window` | average the last W measurements before comparing, so one lucky or unlucky scoring decides nothing |
-| `early_stop_min_delta` | progress means the smoothed score beats the best by at least this (0..1 scale; loss units if cell-eval is off) |
-| `early_stop_patience` | N measurements in a row without progress, then stop |
+| `window` | average the last W measurements before comparing, so one lucky or unlucky scoring decides nothing |
+| `min_delta` | progress means the smoothed score beats the best by at least this (0..1 scale; loss units if cell-eval is off) |
+| `patience` | N measurements in a row without progress, then stop |
 
 A measurement is one scoring (every `cell_eval_every` epochs) or, with cell-eval off,
 one epoch's val loss. A reasonable start with `cell_eval_every: 5` is patience 3,
@@ -565,22 +614,22 @@ refers to them by their short name.
 | Folder | File | Lines | What it holds |
 |---|---|---|---|
 | `data/` | `vocab.py` | 106 | the two index spaces |
-| | `shared_pca.py` | 130 | ONE masked/EM PCA basis, fit across contexts; frozen, reusable on new ones |
-| | `dataset.py` | 197 | pairing, gene scatter, per-batch mask, context sampler |
-| | `prepare.py` | 291 | **run:** h5ad → per-context npz, shared PCA fit + project, splits |
-| `models/` | `encoders.py` | 106 | pert / state / time encoders + upgrade notes (no context encoder) |
-| | `velocity.py` | 128 | the field, both heads; mask is an argument, not a lookup |
-| | `flow.py` | 122 | CFM loss, Euler sampler, lognorm→counts, mask-from-gene_idx helper |
-| | `build.py` | 37 | `build_model`, `pick_device` — shared by training, evaluation and prediction |
-| `training/` | `train.py` | 279 | **run:** loop, AdamW + cosine, per-epoch cell-eval, checkpoints, early stop |
-| | `stopping.py` | 55 | plateau rule: smoothing + minimum improvement + patience |
-| `evaluation/` | `evaluate.py` | 182 | **run:** metrics + `identity` / `mean_shift` baselines, `--vcc` |
-| | `cell_eval.py` | 385 | the six VCC2026 members via `cell-eval2` (`ValScorer`), used by `evaluate` and `train` |
-| | `metrics.py` | 30 | energy distance, Pearson r |
-| `prediction/` | `predict.py` | 531 | **run:** model + any unperturbed `.h5ad` → predicted counts |
-| | `counts_writer.py` | 138 | streams blocks into an `.h5ad`, checking each, then moves it into place |
-| `submission/` | `submit_vcc26.py` | 330 | **run:** `package` (pre-flight + `vcc prep`), `upload`, `submit`; by you, never by a script |
-| | `file_rules.py` | 72 | the portal's label rules (contexts, perturbation set, 400 cells, gene order) |
+|  | `shared_pca.py` | 130 | ONE masked/EM PCA basis; frozen, reusable on unseen lines |
+|  | `state.py` | 61 | fits the basis per run, attaches each cell's state vector |
+|  | `dataset.py` | 209 | pairing, gene scatter, per-batch mask, context sampler |
+|  | `prepare.py` | 182 | **run:** h5ad → per-context npz. No split, no PCA. |
+| `models/` | `encoders.py` | 106 | pert / state / time encoders (no context encoder) |
+|  | `velocity.py` | 128 | the field, both heads; mask is an argument, not a lookup |
+|  | `flow.py` | 122 | CFM loss, Euler sampler, lognorm→counts, mask helper |
+|  | `build.py` | 37 | `build_model`, `pick_device` — shared by training and prediction |
+| `training/` | `train.py` | 473 | **run:** holdout / crossval / full, cell-eval, checkpoints |
+|  | `stopping.py` | 55 | plateau rule: smoothing + minimum improvement + patience |
+| `evaluation/` | `cell_eval.py` | 470 | the six VCC2026 members via `cell-eval2` (`ValScorer`) |
+|  | `metrics.py` | 30 | energy distance, Pearson r |
+| `prediction/` | `predict.py` | 562 | **run:** model + any unperturbed `.h5ad` → predicted counts |
+|  | `counts_writer.py` | 138 | streams blocks into an `.h5ad`, checking each |
+| `submission/` | `submit_vcc26.py` | 330 | **run:** `package` / `upload` / `submit`; by you, never by a script |
+|  | `file_rules.py` | 72 | the portal's label rules |
 
 Run everything as `python -m signalflow.<folder>.<script>` from the repo root, e.g.
 `python -m signalflow.training.train --config configs/prototype.yaml`.

@@ -1,63 +1,89 @@
 # SignalFlow -- one-word entry points for the pipeline.
 #
-#   make training     prepare -> train -> evaluate on the test split
+#   make prepare      raw .h5ad -> data/processed/   (run once per data change)
+#   make holdout      train, keeping ONE cell line out      -- everyday model changes
+#   make crossval     hold each line out in turn            -- reliable comparison + epoch count
+#   make train-full   train on EVERY line, no validation    -- the final model
 #   make prediction   predict the VCC26 contexts -> $(PRED)
 #   make submission   package AND upload in one call (asks you to confirm first)
 #
 # Override any variable on the command line, e.g.
+#   make holdout CONFIG=configs/other.yaml
 #   make submission MODEL_NAME="SignalFlow_0.1"
-#   make prediction CHECKPOINT=runs/prototype/best_vcc.pt
 #
 # Preview what a target would run WITHOUT running it:   make -n submission
 
 CONFIG     ?= configs/prototype.yaml
 PY         ?= .venv/bin/python
 CONTROLS   ?= data/VCC26/controls
-PRED       ?= runs/prototype/predictions.h5ad
+RUNS       ?= runs/prototype
+CKPT       ?= $(RUNS)/full/last.pt
+PRED       ?= $(RUNS)/predictions.h5ad
 MODEL_NAME ?= SignalFlow_0.0
-# empty = each script's own default, best.pt in the config's out_dir
-CHECKPOINT ?=
 
-CKPT_ARG = $(if $(CHECKPOINT),--checkpoint $(CHECKPOINT))
+# Run choices (held-out line, epochs, early stopping) are NOT here: they live in the config's
+# `train:` block, the one place they are set. The targets below only pick the mode.
 
 .DEFAULT_GOAL := help
-.PHONY: help training prediction submission prepare train evaluate
-# `training` is three steps that must run in order, even under `make -j`
+.PHONY: help prepare holdout crossval train-full holdout-vcc25 prediction submission tensorboard
 .NOTPARALLEL:
 
 help:
-	@echo "make training     prepare -> train -> evaluate (test split)"
-	@echo "make prediction   predict VCC26 -> $(PRED)"
+	@echo "make prepare      raw .h5ad -> data/processed/   (once per data change)"
+	@echo ""
+	@echo "make holdout      train, ONE cell line held out   -- everyday model changes"
+	@echo "make holdout-vcc25  hold out ALL VCC25 lines together as validation"
+	@echo "make crossval     hold each line out in turn      -- comparison + epoch count"
+	@echo "make train-full   train on EVERY line             -- the final model (train.full_epochs)"
+	@echo ""
+	@echo "make tensorboard  training curves of every run (loss, val loss, cell-eval)"
+	@echo ""
+	@echo "make prediction   predict VCC26 -> $(PRED)   (CKPT=$(CKPT))"
 	@echo "make submission   package + upload in one call; you confirm before anything is sent"
 	@echo ""
-	@echo "parts of training, if you only want one:  make prepare | make train | make evaluate"
-	@echo "preview any target without running it:    make -n <target>"
+	@echo "preview a target without running it:  make -n <target>"
 
-# ---- 1. training -------------------------------------------------------------
+# ---- data --------------------------------------------------------------------
 
 prepare:
 	$(PY) -m signalflow.data.prepare --config $(CONFIG)
 
-train:
-	$(PY) -m signalflow.training.train --config $(CONFIG)
+# ---- training ----------------------------------------------------------------
 
-evaluate:
-	$(PY) -m signalflow.evaluation.evaluate --config $(CONFIG) --split test --vcc $(CKPT_ARG)
+holdout:
+	$(PY) -m signalflow.training.train --config $(CONFIG) --mode holdout
 
-training: prepare train evaluate
+# validate on ALL the VCC25__* lines together (the flag replaces train.holdout)
+holdout-vcc25:
+	$(PY) -m signalflow.training.train --config $(CONFIG) --mode holdout --vcc25
 
-# ---- 2. prediction -----------------------------------------------------------
+crossval:
+	$(PY) -m signalflow.training.train --config $(CONFIG) --mode crossval
+
+# trains exactly train.full_epochs (from the config); crossval recommends the value
+train-full:
+	$(PY) -m signalflow.training.train --config $(CONFIG) --mode full
+
+# ---- monitoring --------------------------------------------------------------
+# curves of every run under train.out_dir (loss, val loss, cell-eval members); open the printed URL
+
+tensorboard:
+	$(PY) -m tensorboard.main --logdir $(RUNS)
+
+# ---- prediction --------------------------------------------------------------
+# CKPT defaults to the `full` run's last.pt; its folder must hold the pca_shared.npz
+# that model was trained with (every run writes one).
 
 prediction:
 	$(PY) -m signalflow.prediction.predict --config $(CONFIG) \
+	    --checkpoint $(CKPT) \
 	    --input $(CONTROLS) \
 	    --manifest $(CONTROLS)/manifest.json \
 	    --perts $(CONTROLS)/pert_counts.csv \
 	    --reference-genes $(CONTROLS)/gene_names.csv \
-	    $(CKPT_ARG) \
 	    --out $(PRED)
 
-# ---- 3. submission -----------------------------------------------------------
+# ---- submission --------------------------------------------------------------
 # package + upload in ONE call. It does not run `prediction` first, and it asks you
 # to type `submit` before anything leaves this machine. Needs ~22 GiB of RAM for a
 # full-size file, so it will refuse on a 16 GB machine.

@@ -16,13 +16,20 @@ cell line is either training data or held out, decided here per run -- because t
 shared PCA basis has to be fit without the held-out line, so it is fit here too, once
 per run, and saved next to the checkpoint (`prediction/predict.py` reads it from there).
 
-EPOCHS
-    `train.epochs` is the MAXIMUM: early stopping only ever stops sooner. In `full` mode
-    it is the exact count. Treat it as a hyperparameter: crossval finds it, full uses it.
+WHERE THE RUN CHOICES ARE SET: IN THE YAML, AND ONLY THERE
+    `train.holdout`, `max_epochs`, `full_epochs` and the `early_stop` block (metric, patience,
+    window, min_delta) say what a run does. The only flag is `--mode`, which the Makefile
+    targets pass. There are no code or Makefile defaults: a missing key is an error, so
+    there is no hidden second value.
 
-WHAT EARLY STOPPING WATCHES  (`train.early_stop_metric`)
+EPOCHS
+    `train.max_epochs` is the MAXIMUM in holdout/crossval: early stopping only ever stops sooner.
+    `train.full_epochs` is the exact count in `full` mode. Treat it as a hyperparameter: crossval finds it,
+    full uses it.
+
+WHAT EARLY STOPPING WATCHES  (`train.early_stop.metric`)
     vcc        the cell-eval average on the held-out line: what the challenge scores, but
-               noisy and slower, so it is measured every `cell_eval_every` epochs and
+               noisy and slower, so it is measured every `train.cell_eval_every` epochs and
                smoothed (see `stopping.py`).
     val_loss   the flow-matching loss on the held-out line: cheap, every epoch, but only a
                proxy (mostly irreducible noise), and it need not agree with the metrics.
@@ -37,6 +44,7 @@ WHAT A RUN WRITES  (into `<out_dir>/holdout_<line>/`, `.../crossval/fold_<line>/
     pca_shared.npz  the PCA basis this model was trained with -- it belongs to the model
     run.json      mode, contexts, perturbations trained on, epochs, best epoch/score
     history.json  every epoch's numbers
+    tb/           TensorBoard curves (`make tensorboard`)
     train.log     everything printed, plus what is kept off the terminal
 Everything is rewritten after EVERY epoch, so Ctrl-C costs at most the epoch in progress.
 
@@ -69,6 +77,7 @@ from ..data.vocab import CONTROL_LABEL
 from ..models.build import build_model, pick_device
 from ..models.flow import cfm_loss
 from .stopping import PlateauStopper
+from .tb import RunLog
 
 
 def to_device(batch, device):
@@ -143,6 +152,7 @@ def train_run(
     run_dir: Path,
     epochs: int,
     mode: str,
+    stop: dict | None,
     device_arg: str | None = None,
 ) -> dict:
     """One training run. `val_names` empty means no validation (full mode).
@@ -157,11 +167,11 @@ def train_run(
     header = f"{mode}" + (f"  holding out {', '.join(val_names)}" if val_names else "  (all contexts)")
     with _logged(run_dir, f"train {header}") as to_log:
         return _train_run(cfg, meta, contexts, train_names, val_names, run_dir, epochs, mode,
-                          device_arg, to_log, tcfg, mcfg, seed)
+                          stop, device_arg, to_log, tcfg, mcfg, seed)
 
 
 def _train_run(cfg, meta, contexts, train_names, val_names, run_dir, epochs, mode,
-               device_arg, to_log, tcfg, mcfg, seed) -> dict:
+               stop, device_arg, to_log, tcfg, mcfg, seed) -> dict:
     train_ctx = [c for c in contexts if c.name in train_names]
     val_ctx = [c for c in contexts if c.name in val_names]
     device = pick_device(device_arg or tcfg.get("device", "auto"))
@@ -221,14 +231,13 @@ def _train_run(cfg, meta, contexts, train_names, val_names, run_dir, epochs, mod
         "train_contexts": [c.name for c in train_ctx], "held_out": [c.name for c in val_ctx],
         "trained_perts": [pert_names[p] for p in trained_perts],
         "max_epochs": epochs,
+        "stop": stop,                      # the exact stopping settings this run used
     }
     (run_dir / "run.json").write_text(json.dumps(run_info, indent=2))
 
     # ---- what to watch, and whether we can ---------------------------------------------
     every = int(tcfg.get("cell_eval_every", 0))
-    metric = str(tcfg.get("early_stop_metric", "vcc"))
-    if metric not in ("vcc", "val_loss"):
-        raise SystemExit(f"train.early_stop_metric must be 'vcc' or 'val_loss', got {metric!r}")
+    metric = stop["metric"] if stop else None
     scorer, ref = None, None
     if val_ds is not None and every > 0:
         from ..evaluation.cell_eval import ValScorer, format_reference, summarize
@@ -255,14 +264,12 @@ def _train_run(cfg, meta, contexts, train_names, val_names, run_dir, epochs, mod
         print("NOTE: early stopping falls back to the held-out LOSS, because cell-eval is unavailable.\n")
 
     stopper = PlateauStopper(
-        patience=int(tcfg.get("early_stop_patience", 0)) if val_ds is not None else 0,
-        min_delta=float(tcfg.get("early_stop_min_delta", 0.0)),
-        window=int(tcfg.get("early_stop_window", 1)),
+        patience=stop["patience"] if stop else 0,
+        min_delta=stop["min_delta"] if stop else 0.0,
+        window=stop["window"] if stop else 1,
     )
-    if val_ds is None and int(tcfg.get("early_stop_patience", 0)):
-        print("NOTE: no held-out data in this run, so early stopping is off; it trains all "
-              f"{epochs} epochs.\n")
 
+    tb = RunLog(run_dir)
     history, best_loss = [], float("inf")
     best_vcc, best_vcc_ep, ep = float("-inf"), 0, 0
     vcc_track: list[tuple[int, float]] = []
@@ -336,6 +343,9 @@ def _train_run(cfg, meta, contexts, train_names, val_names, run_dir, epochs, mod
                     s, f"cell-eval (held out) after epoch {ep}   [{time.time()-t1:.0f}s]",
                     ref_avg=ref["mean_shift"]["avg_score"], note=note))
             history.append(entry)
+            tb.epoch(entry, lr=opt.param_groups[0]["lr"])
+            if "vcc_avg_score" in entry:
+                tb.baselines(ref, ep)
 
             _save(run_dir / "last.pt", model, cfg, ep)
             (run_dir / "history.json").write_text(json.dumps(history, indent=2))
@@ -351,6 +361,7 @@ def _train_run(cfg, meta, contexts, train_names, val_names, run_dir, epochs, mod
     except KeyboardInterrupt:
         print(f"\ninterrupted during epoch {max(ep, 1)}; nothing from that epoch is kept")
 
+    tb.close()
     epochs_run = history[-1]["epoch"] if history else 0
     summary = {
         **run_info,
@@ -418,40 +429,76 @@ def _summarise_crossval(folds: list[dict], out: Path, max_epochs: int) -> dict:
         print(f"  WARNING: {len(capped)} fold(s) were still improving at the maximum of {max_epochs} epochs "
               f"({', '.join(capped)}). Raise train.epochs and re-run before trusting the recommendation.")
     print(f"  written: {out / 'summary.json'}")
-    print("  next:  make train-full EPOCHS=" + str(recommended))
+    print("  next:  set train.full_epochs: " + str(recommended) + " in the config, then make train-full")
     return summary
+
+
+def _need(tcfg: dict, key: str, cfg_path: str):
+    if key not in tcfg:
+        raise SystemExit(f"{cfg_path}: train.{key} is missing. It is a run choice and is never guessed "
+                         f"-- set it in the config (see configs/prototype.yaml).")
+    return tcfg[key]
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", required=True)
-    ap.add_argument("--mode", choices=("holdout", "crossval", "full"), default=None,
-                    help="overrides train.mode")
-    ap.add_argument("--holdout", default=None, help="holdout mode: the cell line to keep out (overrides train.holdout)")
-    ap.add_argument("--epochs", type=int, default=None, help="overrides train.epochs (the MAXIMUM; the exact count in full mode)")
+    ap.add_argument("--mode", choices=("holdout", "crossval", "full"), required=True)
+    ap.add_argument("--vcc25", action="store_true",
+                    help="holdout mode: validate on ALL the VCC25__* lines together (instead of train.holdout)")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
     tcfg = cfg["train"]
-    mode = args.mode or tcfg.get("mode", "holdout")
-    epochs = args.epochs or int(tcfg.get("epochs", 30))
+
+    # every run choice comes from the YAML and only from there; --mode just says which run to do
+    stop = None
+    if args.mode == "full":
+        epochs = int(_need(tcfg, "full_epochs", args.config))
+    else:
+        epochs = int(_need(tcfg, "max_epochs", args.config))
+        es = _need(tcfg, "early_stop", args.config)
+        for k in ("metric", "patience", "window", "min_delta"):
+            if k not in es:
+                raise SystemExit(f"{args.config}: train.early_stop.{k} is missing (never guessed).")
+        if es["metric"] not in ("vcc", "val_loss"):
+            raise SystemExit("train.early_stop.metric must be 'vcc' or 'val_loss'")
+        if es["patience"] < 0 or es["window"] < 1:
+            raise SystemExit("train.early_stop.patience must be >= 0 and window >= 1")
+        stop = {"metric": es["metric"], "patience": int(es["patience"]),
+                "window": int(es["window"]), "min_delta": float(es["min_delta"])}
+    if epochs < 1:
+        raise SystemExit("the epoch count must be at least 1")
+
     base = Path(tcfg.get("out_dir", "runs/prototype"))
 
     meta, contexts = load_contexts(cfg["data"]["processed_dir"])
     names = [c.name for c in contexts]
 
-    if mode == "full":
-        train_run(cfg, meta, contexts, names, [], base / "full", epochs, "full", args.device)
+    if args.mode == "full":
+        train_run(cfg, meta, contexts, names, [], base / "full", epochs, "full", None, args.device)
         return
 
-    if mode == "holdout":
-        line = args.holdout or tcfg.get("holdout")
+    if args.vcc25 and args.mode != "holdout":
+        raise SystemExit("--vcc25 only applies to --mode holdout")
+    if args.mode == "holdout" and args.vcc25:
+        val = [n for n in names if n.startswith("VCC25__")]
+        if not val:
+            raise SystemExit("--vcc25: no context named VCC25__* in the processed data")
+        if "holdout" in tcfg:
+            print(f"NOTE: --vcc25 is set, so train.holdout ({tcfg['holdout']}) is ignored.")
+        train_run(cfg, meta, contexts, [n for n in names if n not in val], val,
+                  base / "holdout_vcc25", epochs, "holdout", stop, args.device)
+        return
+
+    if args.mode == "holdout":
+        line = _need(tcfg, "holdout", args.config)
         if line not in names:
-            raise SystemExit(f"train.holdout / --holdout must be one of the cell lines:\n  " + "\n  ".join(names)
+            raise SystemExit("train.holdout must be one of the cell lines:\n  " + "\n  ".join(names)
                              + f"\n(got {line!r})")
         train_run(cfg, meta, contexts, [n for n in names if n != line], [line],
-                  base / f"holdout_{line}", epochs, "holdout", args.device)
+                  base / f"holdout_{line}", epochs, "holdout", stop, args.device)
         return
 
     # crossval: every line (or `train.crossval_lines`) is held out once
@@ -465,7 +512,7 @@ def main() -> None:
     for k, line in enumerate(lines, 1):
         print(f"\n########## fold {k}/{len(lines)}: holding out {line} ##########")
         folds.append(train_run(cfg, meta, contexts, [n for n in names if n != line], [line],
-                               out / f"fold_{line}", epochs, "crossval", args.device))
+                               out / f"fold_{line}", epochs, "crossval", stop, args.device))
     _summarise_crossval(folds, out, epochs)
 
 
