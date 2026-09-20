@@ -32,12 +32,20 @@ model:
   dropout: 0.0
   head: plain                   # "plain" | "dirmag" (direction x magnitude)
 
+  # the perturbation's SECOND embedding: how the knocked-out gene co-expresses in the
+  # cell line at hand, computed from its control cells (data/gene_corr.py) and summed
+  # with the learned one-hot row. Computed, not learned, so an unseen perturbation is
+  # not left with a random vector. Needs a `prepare` new enough to have written the
+  # correlation rows. false = the old one-hot-only model.
+  pert_corr: true
+  pert_corr_hidden: 256         # width of its projection of the [n_genes] correlation row
+
 train:
   device: auto                  # cuda -> mps -> cpu
 
   # ---- what a run does (the ONLY place these are set; `make` passes just the mode) ----
   holdout: VCC25__adata_Test    # holdout mode: the ONE cell line kept out as validation
-  max_epochs: 5                 # holdout/crossval: the MAXIMUM (early stopping may stop sooner);
+  max_epochs: 10                 # holdout/crossval: the MAXIMUM (early stopping may stop sooner);
                                 #   5 is the prototype's quick value, raise it for real runs
   full_epochs: 5                # full mode: the EXACT count. Take it from `make crossval`'s
                                 #   recommendation (summary.json) for the real model.

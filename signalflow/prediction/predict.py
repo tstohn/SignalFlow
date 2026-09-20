@@ -103,15 +103,18 @@ GETTING BACK TO COUNTS
     are then clipped to the per-cell cap and rounded, which is what makes them
     whole numbers rather than a float matrix that looks like counts.
 
-WHAT THIS STILL CANNOT FIX
-    A one-hot `PertEncoder` has one row per perturbation, trained only from
-    cells carrying it. A perturbation absent from training keeps its random
-    init, so the model cannot generalise to it -- not badly, at all (README
-    §6). `preflight()` counts these and WARNS -- it does not stop the run: a
-    file that passes every rule above and contains noise for that reason is the
-    expensive failure here, so read that warning. The cell-line side of this
-    problem is gone (that was `ContextEncoder`); the perturbation side is still
-    open.
+UNTRAINED PERTURBATIONS, AND WHAT NOW CARRIES THEM
+    The learned `PertEncoder` row of a perturbation absent from training is
+    still at its random init. What it no longer rides on alone is
+    `PertCorrEncoder`: this script computes, from the INPUT cells themselves,
+    the correlation of each knocked-out gene with every gene in that cell line
+    (`data/gene_corr.py`) and feeds it alongside. That needs no training data
+    and no refit -- but it needs the knocked-out gene to be one this context
+    measures, and it is an association, not a direction. `preflight()` still
+    counts untrained perturbations and WARNS without stopping the run: a file
+    that passes every rule above and is mostly noise is the expensive failure
+    here, so read that warning, and the per-context count of correlation rows
+    printed next to it.
 
 GENE VOCABULARIES MUST MATCH, WITH NO OVERRIDE
     The model's readout vocabulary is what the output's `.var` is built from.
@@ -135,7 +138,7 @@ import scipy.sparse as sp
 import torch
 import yaml
 
-from ..data import shared_pca
+from ..data import gene_corr, shared_pca
 from ..data.vocab import CONTROL_LABEL, GeneVocab
 from ..models.build import build_model, pick_device
 from ..models.flow import integrate, mask_from_gene_idx
@@ -336,8 +339,9 @@ def preflight(
     if unseen:
         warnings.append(
             f"{len(unseen)}/{len(want_perts)} perturbations were never trained "
-            f"(e.g. {', '.join(unseen[:4])}). A one-hot PertEncoder leaves these "
-            f"at their random init -- the model cannot generalise to them at all"
+            f"(e.g. {', '.join(unseen[:4])}). Their learned PertEncoder row is still at "
+            f"its random init; only PertCorrEncoder's per-cell-line correlations speak "
+            f"for them, and only where the knocked-out gene is a readout gene here"
         )
     return warnings
 
@@ -525,6 +529,31 @@ def main() -> None:
         state, lib = _cell_state(x_log, counts, gene_idx, loadings, pca_mu)
         print(f"  context {label}: {counts.shape[0]:,} unperturbed cells -> {len(want_perts)} perturbations")
 
+        # The perturbation's second embedding, computed HERE from this cell line's own
+        # unperturbed cells -- the same function `prepare` runs on the training lines
+        # (data/gene_corr.py). This is the half of the conditioning that does not need
+        # the model to have seen the perturbation, so it is what a never-trained
+        # perturbation rests on. Nothing about it needs training data or a refit.
+        pcorr_g = pcorr_ok = None
+        if getattr(model, "pert_corr_enc", None) is not None:
+            local_names = [g for g, kn in zip(var_names, known) if kn]
+            keep, cols = gene_corr.local_columns(want_perts, {g: j for j, g in enumerate(local_names)})
+            rows = gene_corr.corr_rows(x_log, np.array(cols, dtype=np.int64))
+            pcorr_g = np.zeros((len(want_perts), G), dtype=np.float32)
+            pcorr_ok = np.zeros((len(want_perts), 1), dtype=np.float32)
+            for k_row, pos in enumerate(keep):
+                pcorr_g[pos, gene_idx] = rows[k_row]
+                pcorr_ok[pos] = 1.0
+            n_ok = int(pcorr_ok.sum())
+            print(
+                f"    correlation rows for {n_ok}/{len(want_perts)} perturbations"
+                + ("" if n_ok == len(want_perts) else
+                   f"; the other {len(want_perts) - n_ok} knock out a gene this context "
+                   f"does not measure, so they fall back to the learned lookup alone")
+            )
+            if counts.shape[0] < gene_corr.MIN_CELLS:
+                print(f"    warning: only {counts.shape[0]} cells -- these correlations are noisy")
+
         for j, p in enumerate(want_perts):
             src = rng.choice(counts.shape[0], size=per_pert, replace=per_pert > counts.shape[0])
             x0_local = np.asarray(x_log[src].todense(), dtype=np.float32)
@@ -538,6 +567,10 @@ def main() -> None:
                     torch.from_numpy(state[src]).to(device),
                     mask_from_gene_idx(gene_idx, G, per_pert).to(device),
                     n_steps=args.n_steps,
+                    pert_corr=None if pcorr_g is None else
+                        torch.from_numpy(pcorr_g[j : j + 1]).to(device).expand(per_pert, G),
+                    pert_corr_ok=None if pcorr_ok is None else
+                        torch.from_numpy(pcorr_ok[j : j + 1]).to(device).expand(per_pert, 1),
                 ).cpu().numpy()
             writer.append(_to_counts(pred, lib[src], cap))
             n_done += 1

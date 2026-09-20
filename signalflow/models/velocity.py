@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .encoders import PertEncoder, StateEncoder, TimeEncoder
+from .encoders import PertCorrEncoder, PertEncoder, StateEncoder, TimeEncoder
 
 
 class _ResBlock(nn.Module):
@@ -67,12 +67,19 @@ class VelocityField(nn.Module):
         time_dim: int = 32,
         dropout: float = 0.0,
         head: str = "plain",
+        pert_corr: bool = True,
+        pert_corr_hidden: int = 256,
     ) -> None:
         super().__init__()
         self.n_genes = n_genes
         self.head_kind = head
 
         self.pert_enc = PertEncoder(n_perts, pert_dim)
+        # summed with the lookup, not concatenated: same cond_dim, and a
+        # perturbation with no correlation row falls back to exactly the lookup
+        self.pert_corr_enc = (
+            PertCorrEncoder(n_genes, pert_dim, pert_corr_hidden) if pert_corr else None
+        )
         self.state_enc = StateEncoder(n_state, state_dim)
         self.time_enc = TimeEncoder(time_dim)
         cond_dim = pert_dim + state_dim + time_dim
@@ -103,13 +110,25 @@ class VelocityField(nn.Module):
         pert: torch.Tensor,    # [B]
         state: torch.Tensor,   # [B, n_state]
         mask: torch.Tensor,    # [B, G] -- which genes THIS cell's data has
+        pert_corr: torch.Tensor | None = None,    # [B, G] -- see encoders.PertCorrEncoder
+        pert_corr_ok: torch.Tensor | None = None,  # [B, 1]
     ) -> torch.Tensor:
         m = mask
         h = self.inp(torch.cat([x_t * m, m], dim=-1))
 
+        p = self.pert_enc(pert)
+        if self.pert_corr_enc is not None:
+            if pert_corr is None or pert_corr_ok is None:
+                raise ValueError(
+                    "this model was built with pert_corr=True, so forward() needs "
+                    "pert_corr and pert_corr_ok (dataset.collate puts them in the batch "
+                    "as 'pcorr'/'pcorr_ok'; see data/gene_corr.py)"
+                )
+            p = p + self.pert_corr_enc(pert_corr, pert_corr_ok, m)
+
         c = torch.cat(
             [
-                self.pert_enc(pert),
+                p,
                 self.state_enc(state),
                 self.time_enc(t),
             ],

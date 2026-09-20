@@ -34,4 +34,6 @@ def build_model(n_genes: int, n_perts: int, n_state: int, mcfg: dict) -> Velocit
         time_dim=int(mcfg.get("time_dim", 32)),
         dropout=float(mcfg.get("dropout", 0.0)),
         head=mcfg.get("head", "plain"),
+        pert_corr=bool(mcfg.get("pert_corr", True)),
+        pert_corr_hidden=int(mcfg.get("pert_corr_hidden", 256)),
     )

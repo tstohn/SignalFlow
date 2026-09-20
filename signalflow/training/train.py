@@ -476,6 +476,14 @@ def main() -> None:
     meta, contexts = load_contexts(cfg["data"]["processed_dir"])
     names = [c.name for c in contexts]
 
+    # model.pert_corr needs the per-cell-line correlation rows `prepare` writes
+    if bool(cfg["model"].get("pert_corr", True)) and not any(c.corr_at for c in contexts):
+        raise SystemExit(
+            f"{cfg['data']['processed_dir']}: no gene-gene correlation rows, but "
+            f"model.pert_corr is on. They are written by `prepare` -- re-run "
+            f"`make prepare` (or set model.pert_corr: false for the one-hot-only model)."
+        )
+
     if args.mode == "full":
         train_run(cfg, meta, contexts, names, [], base / "full", epochs, "full", None, args.device)
         return

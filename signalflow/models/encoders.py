@@ -2,7 +2,9 @@
 
 The three things the velocity field is conditioned on:
 
-  PertEncoder     which gene was knocked out
+  PertEncoder     which gene was knocked out (a learned row per perturbation)
+  PertCorrEncoder how that gene co-expresses in THIS cell line (computed, not
+                  learned -- the half that survives an unseen perturbation)
   StateEncoder    what kind of cell we started from
   time features   where along the flow we are
 
@@ -45,11 +47,14 @@ class PertEncoder(nn.Module):
     the prototype data no perturbation is shared between any two of the eight
     files, so a held-out-perturbation split would score pure noise.
 
-    Upgrade path (this is the one that unlocks unseen perturbations): replace
-    the lookup with a projection of *features* of the knocked-out gene --
-    its own expression profile across control cells, an OmniPath/STRING
-    network embedding, a DepMap essentiality vector. Same output shape, so
-    nothing downstream changes.
+    That limit is now only half the story: `PertCorrEncoder` below adds a
+    computed, per-cell-line description of the same gene and is summed with this
+    one, so an unseen perturbation is no longer left with nothing but its random
+    row. This lookup remains the part that memorises a specific knockout well.
+
+    Upgrade path: feed *more* features of the knocked-out gene the same way --
+    an OmniPath/STRING network embedding, a DepMap essentiality vector. Same
+    output shape, so nothing downstream changes.
     """
 
     def __init__(self, n_perts: int, dim: int = 64) -> None:
@@ -63,6 +68,56 @@ class PertEncoder(nn.Module):
 
     def forward(self, pert: torch.Tensor) -> torch.Tensor:
         return self.emb(pert)
+
+
+class PertCorrEncoder(nn.Module):
+    """The knocked-out gene's co-expression profile IN THIS CELL LINE -> dense vector.
+
+    Input is one row of `data/gene_corr.py`: for the cell the model is looking
+    at, the correlation of the perturbed gene with every readout gene, measured
+    across that cell line's control cells, zero outside its panel. It is
+    computed from data, never learned, so a perturbation the model never trained
+    on still arrives as something meaningful rather than as a random row --
+    which is exactly what `PertEncoder` alone cannot do. The two are summed, so
+    this is a correction on top of the lookup: a perturbation seen often keeps
+    its own learned row, an unseen one is carried by this term alone.
+
+    `ok` is 0 when there is no row at all (the knocked-out gene is not a readout
+    gene here, or is silent in the controls). The output is multiplied by it, so
+    "nothing is known" contributes exactly zero rather than a zero vector that
+    would read as "correlates with nothing" -- the gene-mask discipline again.
+
+    The last layer is zero-initialised: at the start of training this term is
+    exactly 0, so the run begins from the one-hot model's behaviour and moves
+    away from it only as the correlations earn their place.
+
+    Scaling matters here and is easy to get wrong: a cell line measuring 16,000
+    genes would otherwise deliver ~4x the input magnitude of one measuring
+    1,000, for no biological reason. Dividing by sqrt(number of measured genes)
+    makes the two comparable -- the same reason the loss never means() over G.
+
+    Upgrade path: this is a bag of correlations, order-free apart from the
+    weights. A gene-axis attention over the top-k correlated genes would let it
+    say "these particular genes move", which is closer to what a pathway is.
+    """
+
+    def __init__(self, n_genes: int, dim: int = 64, hidden: int = 256) -> None:
+        super().__init__()
+        self.proj = nn.Linear(n_genes, hidden)
+        self.out = nn.Linear(hidden, dim)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+        self.out_dim = dim
+
+    def forward(
+        self,
+        corr: torch.Tensor,     # [B, G] correlations, 0 outside the panel
+        ok: torch.Tensor,       # [B, 1] 1 when a row exists
+        mask: torch.Tensor,     # [B, G] which genes this cell's line measures
+    ) -> torch.Tensor:
+        scale = mask.sum(dim=-1, keepdim=True).clamp_min(1.0).sqrt()
+        h = torch.nn.functional.silu(self.proj(corr / scale))
+        return self.out(h) * ok
 
 
 class StateEncoder(nn.Module):

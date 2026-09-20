@@ -304,6 +304,32 @@ The **training** loss is deliberately not an option: it falls every epoch whethe
 not the model generalises, so it cannot detect overfitting. It is used only as a guard
 — a non-finite training loss aborts the run. `max_epochs` is always the **maximum**
 (the exact count in `full` mode); early stopping only ever stops sooner.
+### The perturbation's two embeddings
+
+A perturbation reaches the model twice, and the two halves fail in opposite ways:
+
+| | `PertEncoder` | `PertCorrEncoder` |
+|---|---|---|
+| what it is | one learned row per perturbation (one-hot lookup) | the knocked-out gene's correlation with every readout gene, in the cell line at hand |
+| where it comes from | training | computed from that line's CONTROL cells (`data/gene_corr.py`) |
+| unseen perturbation | random init — says nothing | still works, if that gene is measured there |
+| unseen cell line | unaffected | recomputed from its own controls, no refit |
+
+They are summed, so `PertCorrEncoder` is a correction on the lookup: a perturbation seen
+often keeps its own learned row, an unseen one rests on the correlations alone. Its last
+layer is zero-initialised, so a run starts from exactly the one-hot model's behaviour.
+`model.pert_corr: false` turns it off.
+
+Control cells only, for two reasons that each suffice: correlations from perturbed cells
+would carry the effect being predicted, and controls are all that exists at inference —
+`predict.py` computes the rows from its own input through the same function `prepare`
+uses. When the knocked-out gene is not a readout gene in that line (or is silent in its
+controls) there is no row: the vector is zero and an `ok` flag is 0, so "nothing is known"
+stays distinguishable from "correlates with nothing". Correlation is association, not
+direction, so expect a prior, not a solved problem.
+
+`prepare` must be re-run to write these rows; `train` refuses to start without them.
+
 ### TensorBoard
 
 `make tensorboard` serves the curves of every run under `train.out_dir` (open the printed URL).

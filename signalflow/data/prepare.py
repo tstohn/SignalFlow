@@ -28,6 +28,11 @@ Layout written to <out>/:
         lib          f32   [n_cells]     total UMI count (from raw .X)
         scalars      f32   [n_cells, 3]  log1p(total UMI), log1p(genes detected), mean lognorm
         control_rows int32 [n_control]   row ids of control cells
+        corr_perts   int32 [k]          pert indices this context carries AND measures
+        corr_rows    f16   [k, n_local] per-line gene-gene correlation of that perturbed
+                                        gene with every local gene, over CONTROL cells
+                                        (see gene_corr.py) -- the perturbation embedding
+                                        that does not need to have seen the perturbation
 
 Run:
     python -m signalflow.data.prepare --config configs/prototype.yaml
@@ -44,6 +49,7 @@ import numpy as np
 import scipy.sparse as sp
 import yaml
 
+from . import gene_corr
 from .vocab import CONTROL_LABEL, GeneVocab, PertVocab
 
 N_SCALAR_STATS = 3
@@ -123,8 +129,28 @@ def prepare(cfg: dict) -> Path:
         mean_log = (np.asarray(X_log.sum(axis=1, dtype=np.float64)).ravel() / X_log.shape[1]).astype(np.float32)
         scalars = np.stack([np.log1p(lib), np.log1p(n_det), mean_log], axis=1).astype(np.float32)
 
+        # ---- the perturbation's second embedding: this line's gene-gene correlations ----
+        # One row per perturbation THIS line carries: the correlation of the knocked-out
+        # gene with every gene of this panel, over CONTROL cells only (no leakage, and the
+        # only thing that exists at inference). Rows for other genes would never be read --
+        # see data/gene_corr.py for why that is the whole storage argument.
+        gene_to_local = {g: j for j, g in enumerate(local_genes)}
+        ctx_perts = np.array(sorted({int(p) for p in np.unique(pert) if p != 0}), dtype=np.int32)
+        keep, cols = gene_corr.local_columns([perts.names[p] for p in ctx_perts], gene_to_local)
+        corr_perts = ctx_perts[keep] if len(keep) else np.zeros(0, dtype=np.int32)
+        if len(control_rows) < gene_corr.MIN_CELLS and len(cols):
+            print(
+                f"  {name}: only {len(control_rows)} control cells -- its gene-gene "
+                f"correlations are noisy (< {gene_corr.MIN_CELLS})"
+            )
+        corr = gene_corr.corr_rows(X_log[control_rows], np.array(cols, dtype=np.int64))
+
         np.savez_compressed(
             out / "contexts" / f"{name}.npz",
+            corr_perts=corr_perts,
+            # float16: these are correlations in [-1, 1], where ~3 decimals is far more
+            # precision than a few thousand cells can support, and it halves the file
+            corr_rows=corr.astype(np.float16),
             X_data=X_log.data,
             X_indices=X_log.indices,
             X_indptr=X_log.indptr,
@@ -146,11 +172,13 @@ def prepare(cfg: dict) -> Path:
                 "n_local_genes": int(X_log.shape[1]),
                 "n_control": int(len(control_rows)),
                 "perts": sorted({str(g) for g in tg if g != CONTROL_LABEL}),
+                "n_corr_rows": int(len(corr_perts)),
             }
         )
         print(
             f"  {name}: {X_log.shape[0]} cells, {X_log.shape[1]} genes, "
-            f"{len(contexts[-1]['perts'])} perts, {len(control_rows)} controls"
+            f"{len(contexts[-1]['perts'])} perts, {len(control_rows)} controls, "
+            f"corr rows {len(corr_perts)}/{len(ctx_perts)}"
         )
 
     meta = {

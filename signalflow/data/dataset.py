@@ -54,9 +54,25 @@ class ContextStore:
         self.scalars = z["scalars"]
         self.control_rows = z["control_rows"]
         self.state: np.ndarray | None = None
+        # this line's gene-gene correlations, one row per perturbation it carries
+        # (data/gene_corr.py). Missing only in a directory written before they existed.
+        self.corr = z["corr_rows"] if "corr_rows" in z.files else np.zeros((0, len(self.gene_idx)), np.float16)
+        cp = z["corr_perts"] if "corr_perts" in z.files else np.zeros(0, np.int32)
+        self.corr_at = {int(p): i for i, p in enumerate(cp)}
 
     def dense(self, rows: np.ndarray) -> np.ndarray:
         return np.asarray(self.X[rows].todense(), dtype=np.float32)
+
+    def corr_row(self, pert: int) -> np.ndarray | None:
+        """This line's correlation of `pert`'s gene with every LOCAL gene, or None.
+
+        None means there is nothing to say: the knocked-out gene is not in this
+        line's panel (most perturbed genes are not readout genes), or it has no
+        variance across its controls. The caller turns that into an all-zero row
+        plus a 0 in the `ok` flag -- never a silent zero.
+        """
+        i = self.corr_at.get(int(pert))
+        return None if i is None else self.corr[i].astype(np.float32)
 
 
 def load_contexts(processed_dir: str | Path) -> tuple[dict, list[ContextStore]]:
@@ -129,6 +145,12 @@ class FlowDataset(Dataset):
         mask = np.zeros((B, G), dtype=np.float32)
         state = np.zeros((B, self.n_state), dtype=np.float32)
         lib0 = np.zeros(B, dtype=np.float32)
+        pcorr = np.zeros((B, G), dtype=np.float32)
+        pcorr_ok = np.zeros((B, 1), dtype=np.float32)
+
+        pert = np.array(
+            [self.contexts[c].pert[r] for c, r in zip(ctx_ids, rows)], dtype=np.int64
+        )
 
         for c_id in np.unique(ctx_ids):
             c = self.contexts[c_id]
@@ -146,14 +168,27 @@ class FlowDataset(Dataset):
             state[sel] = c.state[src]
             lib0[sel] = c.lib[src]
 
-        pert = np.array(
-            [self.contexts[c].pert[r] for c, r in zip(ctx_ids, rows)], dtype=np.int64
-        )
+            # the perturbation's data-derived embedding: how the knocked-out gene
+            # co-varies with every gene IN THIS CELL LINE. Every cell of one
+            # (context, perturbation) gets the same row -- it describes the
+            # perturbation in this line, not the individual cell. Controls have no
+            # knocked-out gene, so they keep the zero row and ok=0.
+            for p in np.unique(pert[sel]):
+                if p == 0:
+                    continue
+                row = c.corr_row(int(p))
+                if row is None:
+                    continue
+                at = sel[pert[sel] == p]
+                pcorr[np.ix_(at, c.gene_idx)] = row
+                pcorr_ok[at] = 1.0
 
         return {
             "x0": torch.from_numpy(x0),
             "x1": torch.from_numpy(x1),
             "pert": torch.from_numpy(pert),
+            "pcorr": torch.from_numpy(pcorr),
+            "pcorr_ok": torch.from_numpy(pcorr_ok),
             "mask": torch.from_numpy(mask),
             # bookkeeping only -- which source context each row came from. NOT a model input.
             "ctx": torch.from_numpy(ctx_ids),

@@ -320,9 +320,18 @@ class ValScorer:
                 ms_g[:, c.gene_idx] = x0_local + shift[None, :]
                 base["identity"].append(_counts_from_global(x0_g, lib0))
                 base["mean_shift"].append(_counts_from_global(ms_g, lib0))
+                # the perturbation's per-cell-line correlation row (data/gene_corr.py),
+                # scattered into the global gene space once and reused for every cell of
+                # this group -- it describes the perturbation in this line, not the cell
+                pc_g = np.zeros((1, G), dtype=np.float32)
+                row = c.corr_row(p) if p != 0 else None
+                if row is not None:
+                    pc_g[0, c.gene_idx] = row
                 fixed.append(
                     dict(p=p, n=len(src), lib0=lib0,
                          x0=torch.from_numpy(x0_g),
+                         pcorr=torch.from_numpy(pc_g),
+                         pcorr_ok=torch.full((1, 1), 0.0 if row is None else 1.0),
                          state=torch.from_numpy(c.state[src]))
                 )
 
@@ -385,6 +394,8 @@ class ValScorer:
                     g["state"].to(self.device),
                     mask_from_gene_idx(c["gene_idx"], self.G, g["n"]).to(self.device),
                     n_steps=self.n_steps,
+                    pert_corr=g["pcorr"].to(self.device).expand(g["n"], self.G),
+                    pert_corr_ok=g["pcorr_ok"].to(self.device).expand(g["n"], 1),
                 ).cpu().numpy()
             blocks.append(_counts_from_global(out, g["lib0"]))
         return self._score_pred(c, _adata(blocks, c["real_lab"], self.genes), f"{tag}flow | {c['name']}")

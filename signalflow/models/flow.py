@@ -66,7 +66,7 @@ def cfm_loss(
         x_t = x_t + sigma * torch.randn_like(x_t) * m
 
     u = (x1 - x0) * m
-    v = model(x_t, t, pert, state, m)
+    v = model(x_t, t, pert, state, m, batch.get("pcorr"), batch.get("pcorr_ok"))
 
     denom = m.sum().clamp_min(1.0)
     loss = (((v - u) ** 2) * m).sum() / denom
@@ -90,6 +90,8 @@ def integrate(
     mask: torch.Tensor,
     n_steps: int = 20,
     clamp_min: float | None = 0.0,
+    pert_corr: torch.Tensor | None = None,
+    pert_corr_ok: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Euler-integrate the field from t=0 to t=1. Returns predicted lognorm."""
     was_training = model.training
@@ -100,7 +102,7 @@ def integrate(
     dt = 1.0 / n_steps
     for i in range(n_steps):
         t = torch.full((x.shape[0],), i * dt, device=x.device)
-        x = x + dt * model(x, t, pert, state, m)
+        x = x + dt * model(x, t, pert, state, m, pert_corr, pert_corr_ok)
         if clamp_min is not None:
             # lognorm = log1p(CPM) is non-negative by construction
             x = x.clamp_min(clamp_min) * m
