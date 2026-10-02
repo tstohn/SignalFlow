@@ -12,6 +12,16 @@ dependencies = [
     "pyyaml>=6.0.3",
     "scikit-learn>=1.9.0",
     "tensorboard>=2.21.0",
-    "torch>=2.13.0",
+    "torch>=2.7.1,<2.8",
     "vcc-cli>=0.2.1",
 ]
+
+# Driver 525 supports CUDA 12.0 at most and recent torch cu12x builds fail on it
+# ("device busy or unavailable"), so take torch from the CUDA 11.8 index.
+[tool.uv.sources]
+torch = { index = "pytorch-cu118" }
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true

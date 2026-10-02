@@ -1,124 +1,105 @@
-"""Conditional flow matching: the objective, and the sampler that inverts it.
+"""Conditional flow matching in the PCA space: the objective, the sampler, and the way
+back to counts.
 
 TRAINING (one step)
-    x0 ~ control cells of a context        (independent coupling: no pairing)
-    x1 ~ perturbed cells, same context, target gene p
-    t  ~ U(0, 1)
-    x_t = (1 - t) x0 + t x1                (+ optional sigma * noise)
-    u   = x1 - x0                          (velocity of the straight path)
-    loss = masked MSE( v_theta(x_t, t | p, s(x0), mask),  u )
-
-WHY THE LOSS IS ON THE VELOCITY, NOT ON x1
-    Regressing x1 directly gives the conditional *mean* -- one point per
-    perturbation, cell-to-cell heterogeneity gone. That is what GEARS-style
-    models do, and it is why they score poorly on distributional metrics.
-    Under the flow-matching loss the optimum is
-        v*(x_t, t, c) = E[x1 - x0 | x_t, c],
-    and integrating that field transports the whole control distribution onto
-    the whole perturbed distribution. The spread comes out for free.
+    z0 = PCA(control cell), z1 = PCA(its OT-paired perturbed cell), t ~ U(0, 1)
+    (centered flow: z1 = PCA(perturbed cell) - that knockdown's real average shift)
+    z_t = (1 - t) z0 + t z1          u = z1 - z0       (the transition vector)
+    loss = MSE( v_theta(z_t, t | fingerprints, source-cell state), u )    over the K PC scores
 
 SAMPLING
-    Start at a real control cell, Euler-integrate t: 0 -> 1. The endpoint is a
-    predicted perturbed cell in lognorm space. `to_counts` takes it back to
-    UMIs if you need them.
+    Start at a real control cell's z0, Euler-integrate t: 0 -> 1, dz = z1 - z0.
 
-The mask enters as an average over measured genes only. Never mean() over G:
-different contexts measure different numbers of genes, and an unmasked mean
-would make loss magnitudes incomparable across them.
+BACK TO COUNTS: RESIDUAL, NOT A FULL INVERSE
+    x_pred = x0 + dz @ loadings on the model genes -- the source cell's own log1p(CPM)
+    plus the back-projected predicted shift. A full inverse (z1 @ loadings + mu) would
+    throw away every cell's own noise and zeros, which K PCs cannot represent; this way
+    only the perturbation effect passes through the PCA. Then un-log, clip at 0, and
+    back to counts with the source cell's library size. Every non-model gene keeps the
+    source cell's raw count. Used by BOTH the training-time scorer and predict.py.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import scipy.sparse as sp
 import torch
 
 from .velocity import VelocityField
 
 
-def mask_from_gene_idx(gene_idx: np.ndarray, n_genes: int, batch_size: int) -> torch.Tensor:
-    """A [batch_size, n_genes] mask, 1 at `gene_idx`, repeated over cells.
-
-    Every cell drawn from one context shares one gene panel, so this is the
-    same row broadcast -- the thing every inference call needs and used to get
-    via a lookup on a trained context id. Building it here from the caller's
-    own `gene_idx` is what makes that lookup unnecessary.
-    """
-    row = np.zeros(n_genes, dtype=np.float32)
-    row[gene_idx] = 1.0
-    return torch.from_numpy(np.tile(row, (batch_size, 1)))
-
-
-def cfm_loss(
-    model: VelocityField,
-    batch: dict[str, torch.Tensor],
-    sigma: float = 0.0,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    x0, x1 = batch["x0"], batch["x1"]
-    pert, m, state = batch["pert"], batch["mask"], batch["state"]
-
-    t = torch.rand(x0.shape[0], device=x0.device)
-
-    x_t = (1.0 - t)[:, None] * x0 + t[:, None] * x1
+def cfm_loss(model: VelocityField, batch: dict[str, torch.Tensor], sigma: float = 0.0
+             ) -> tuple[torch.Tensor, dict[str, float]]:
+    z0, z1, fp = batch["z0"], batch["z1"], batch["fp"]
+    if "center" in batch:
+        # CENTERED flow (model.centered, stage 2 of the two-stage model): the target cell minus its
+        # knockdown's real average shift, so the flow learns only how cells scatter around the
+        # average -- the average itself is the mean model's (models/mean_model.py)
+        z1 = z1 - batch["center"]
+    t = torch.rand(z0.shape[0], device=z0.device)
+    z_t = (1.0 - t)[:, None] * z0 + t[:, None] * z1
     if sigma > 0:
-        # widens the region of x-space the field is trained on; helps when the
-        # two endpoint clouds barely overlap. sigma=0 is the rectified-flow
-        # / independent-coupling CFM case.
-        x_t = x_t + sigma * torch.randn_like(x_t) * m
-
-    u = (x1 - x0) * m
-    v = model(x_t, t, pert, state, m, batch.get("pcorr"), batch.get("pcorr_ok"))
-
-    denom = m.sum().clamp_min(1.0)
-    loss = (((v - u) ** 2) * m).sum() / denom
-
+        z_t = z_t + sigma * torch.randn_like(z_t) * model.pc_sd
+    u = z1 - z0
+    v = model(z_t, t, fp, batch.get("state"), batch.get("anchor"))
+    loss = ((v - u) ** 2).mean()
     with torch.no_grad():
-        base = ((u**2) * m).sum() / denom          # loss of "predict no change"
-        stats = {
-            "loss": loss.item(),
-            "identity_loss": base.item(),
-            "frac_var_explained": (1.0 - loss / base.clamp_min(1e-12)).item(),
-        }
+        base = (u ** 2).mean()          # the loss of "predict no change"
+        stats = {"loss": loss.item(), "identity_loss": base.item(),
+                 "frac_var_explained": (1.0 - loss / base.clamp_min(1e-12)).item()}
     return loss, stats
 
 
 @torch.no_grad()
-def integrate(
-    model: VelocityField,
-    x0: torch.Tensor,
-    pert: torch.Tensor,
-    state: torch.Tensor,
-    mask: torch.Tensor,
-    n_steps: int = 20,
-    clamp_min: float | None = 0.0,
-    pert_corr: torch.Tensor | None = None,
-    pert_corr_ok: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Euler-integrate the field from t=0 to t=1. Returns predicted lognorm."""
+def integrate(model: VelocityField, z0: torch.Tensor, fp: torch.Tensor, n_steps: int = 20,
+              state: torch.Tensor | None = None, anchor: torch.Tensor | None = None) -> torch.Tensor:
+    """Euler-integrate from t=0 to t=1; returns z1. `state`: the source cells' k-NN state
+    (fixed along the path), for a model that conditions on it."""
     was_training = model.training
     model.eval()
-
-    m = mask
-    x = x0 * m
+    z = z0.clone()
     dt = 1.0 / n_steps
     for i in range(n_steps):
-        t = torch.full((x.shape[0],), i * dt, device=x.device)
-        x = x + dt * model(x, t, pert, state, m, pert_corr, pert_corr_ok)
-        if clamp_min is not None:
-            # lognorm = log1p(CPM) is non-negative by construction
-            x = x.clamp_min(clamp_min) * m
-
+        t = torch.full((z.shape[0],), i * dt, device=z.device)
+        z = z + dt * model(z, t, fp, state, anchor)
     if was_training:
         model.train()
-    return x
+    return z
 
 
-def to_counts(x_lognorm: torch.Tensor, lib: torch.Tensor) -> torch.Tensor:
-    """lognorm -> UMI counts, reusing the source cell's library size.
+def lognorm_counts(x_log: np.ndarray, lib0: np.ndarray) -> np.ndarray:
+    """log1p(CPM) -> whole, non-negative counts at the given library sizes (dense float64)."""
+    cpm = np.expm1(np.clip(x_log.astype(np.float64), 0.0, None))
+    return np.rint(cpm * np.asarray(lib0, dtype=np.float64)[:, None] / 1e6)
 
-    Inverse of the CPM+log1p in the h5ads: expm1 back to CPM, rescale to the
-    cell's own depth. Keeping the source cell's library size is the simple
-    choice; modelling how a perturbation shifts library size is a separate
-    (real) problem and is out of scope for v0.
+
+def residual_counts(x0_log: np.ndarray, model_order: np.ndarray, dz: np.ndarray | None,
+                    loadings: np.ndarray, lib0: np.ndarray, cap: float | None = None,
+                    shift: np.ndarray | None = None, other_shift: np.ndarray | None = None) -> sp.csr_matrix:
+    """Predicted counts over the source cells' LOCAL panel.
+
+    `x0_log` [n, n_local]   the source control cells' log1p(CPM)
+    `model_order` [Gm]      local column of each model gene
+    `dz` [n, K]             predicted z1 - z0 (None: no model shift)
+    `shift` [Gm]            optional fixed log1p shift on the model genes (the mean_shift baseline)
+    `lib0` [n]              the source cells' library sizes
+    `cap`                   optional per-cell total cap (cells above it are scaled down)
+    `other_shift` [n_local] optional log1p shift for the NON-model genes (e.g. the linear
+                            population-mean baseline); None = they keep the source cells' counts
+    Non-model genes -> the source cells' own counts (+ `other_shift`).
     """
-    cpm = torch.expm1(x_lognorm).clamp_min(0.0)
-    return cpm * (lib[:, None] / 1e6)
+    counts = lognorm_counts(x0_log if other_shift is None else x0_log + other_shift[None, :], lib0)
+    x_m = x0_log[:, model_order].astype(np.float64)
+    if dz is not None:
+        x_m = x_m + dz.astype(np.float64) @ loadings.astype(np.float64)
+    if shift is not None:
+        x_m = x_m + shift[None, :]
+    counts[:, model_order] = lognorm_counts(x_m, lib0)
+    if cap is not None:
+        total = counts.sum(axis=1)
+        hot = total > cap
+        if hot.any():
+            counts[hot] = np.rint(counts[hot] * (cap / total[hot])[:, None])
+    out = sp.csr_matrix(counts.astype(np.float32))
+    out.eliminate_zeros()
+    return out

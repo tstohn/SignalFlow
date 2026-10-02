@@ -27,8 +27,10 @@ class PlateauStopper:
             raise ValueError("window must be >= 1")
         self.patience, self.min_delta, self.window = int(patience), float(min_delta), int(window)
         self.values: list[float] = []
-        self.best = -math.inf          # best SMOOTHED value so far
-        self.best_step = 0             # the step (e.g. epoch) at which it was reached
+        self.best = -math.inf          # the REFERENCE: it only rises when a smoothed value beats it
+        self.best_step = 0             #   by min_delta, so it can lag below values already seen
+        self.top = -math.inf           # the highest SMOOTHED value seen so far (what "best" means to a reader)
+        self.top_step = 0              # the step at which that highest value was seen
         self.smoothed = float("nan")   # the smoothed value of the latest measurement
         self.bad = 0                   # consecutive measurements without progress
 
@@ -44,11 +46,18 @@ class PlateauStopper:
         self.values.append(value)
         recent = self.values[-self.window:]
         self.smoothed = sum(recent) / len(recent)
+        if self.smoothed > self.top:
+            self.top, self.top_step = self.smoothed, step
         if self.smoothed > self.best + self.min_delta:
             self.best, self.best_step, self.bad = self.smoothed, step, 0
             return True
         self.bad += 1
         return False
+
+    @property
+    def needs(self) -> float:
+        """The smoothed value the next measurement has to EXCEED to count as progress."""
+        return self.best + self.min_delta
 
     @property
     def should_stop(self) -> bool:

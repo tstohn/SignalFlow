@@ -1,0 +1,158 @@
+# SignalFlow v3_0_0 -- the GENE MODEL: a per-gene DENSITY SHIFT on ALL genes, learned from statistics
+# over many cells (no single cells, no PCA). Optionally a centered flow on top (stage 2).
+# Workflow: the Makefile's "GENE MODEL (v3)" section -- in short:
+#     make gene-crossval        how well it does on cell lines it never saw          (~1 h)
+#     make gene-holdout         train + cell-eval on VCC25 Validation                 (~20 min)
+#     make gene-full            the final gene model on every line
+#     make gene-prediction      predict VCC26 with it
+#   optional stage 2:  make gene-flow-holdout / gene-flow-full, then make prediction
+#
+# ============================== WHAT THE GENE MODEL DOES ============================================
+# For one (cell line, knockdown) and EVERY gene the line measures (up to all 18,533 readout genes):
+#     shift   how far the gene's distribution moves          (mean log1p CPM, knockdown - control)
+#     spread  how much wider / narrower it gets              (log sd ratio, knockdown vs control)
+# Every control cell is then moved gene by gene (the optimal-transport map between two bell curves):
+#     new = old + shift + (exp(spread) - 1) * (old - control mean of the gene)
+# -> the cloud of control cells moves and stretches; every cell keeps its own noise.
+#
+# LEARNED FROM STATISTICS, not cells: one row per (training line, knockdown) with >= 20 cells, the
+# targets its mean shift and sd ratio over all its cells, for every gene (<processed_dir>/gene_stats/,
+# built on first use). Orion / VCC25 measure ~18k genes, Replogle / Nadig ~8-9k: every one is used.
+#
+# ONE small network, shared by all genes (rules, not per-gene answers). Per gene it sees: the
+# knockdown's shift and spread of that gene in OTHER cell lines, the gene's slope on the knocked-out
+# gene in THIS line's controls, the generic knockdown response, the gene's control mean and sd in
+# THIS line, whether it is the target itself; per knockdown: target expression, overall strength.
+# It starts as a least-squares linear model and learns a correction on top.
+#
+# NOTHING IS STORED PER CELL LINE: a never-seen line (VCC26) is described by its own control cells.
+# ==================================================================================================
+seed: 0
+
+data:
+  source_dir: data/Combined
+  glob: "*.h5ad"
+  processed_dir: data/processed/combined
+  layer: lognorm                # CPM + log1p, as written by the subset script
+
+  gene_vocab_csv: data/VCC26/controls/gene_names.csv
+  pert_vocab_csv: data/VCC26/controls/gene_names.csv
+
+  # CONTROL -> PERTURBED PAIRING (optimal transport), per dataset (`make prepare`, stage 2).
+  # Identical to v1_0_2, so its prepared artifacts are reused.
+  coupling:
+    space: dataset_hvg_pca
+    n_hvg: 1000
+    n_pcs: 100
+    hvg_flavor: seurat
+    scale_genes: false
+    n_sources: 10000
+    max_fit_cells: 100000
+
+  # THE PCA SPACE (`make prepare`, stage 3). Identical to v1_0_2.
+  pca:
+    model_genes: shared
+    n_pcs: 1024
+    fit_cells: 20000
+    holdout: [VCC25__adata_Validation]
+    min_cells: 20               # cells a knockdown needs for its average (mean model rows, flow centering)
+    cov_cells: 20000
+    state_knn: 100
+    cell_line_groups:
+      REPLOG__K562_essential_raw_singlecell_01: K562
+      REPLOG__K562_gwps_raw_singlecell_01: K562
+      VCC25__adata_Training: H1
+      VCC25__adata_Test: H1
+      VCC25__adata_Validation: H1
+
+# ---- the GENE MODEL (make gene-crossval / gene-holdout / gene-full / gene-prediction) --------------
+gene:
+  spread: true                  # false = move only (no stretching) -- compare the two in gene-holdout's table
+  spread_weight: 1.0            # loss weight of the spread next to the shift
+  hidden: 128                   # width of the network shared by all genes
+  layers: 2
+  dropout: 0.0
+  rows_per_step: 64             # knockdowns per step (from one context)
+  genes_per_step: 4096          # random genes of that context per step
+  steps_per_epoch: 800
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  ema_decay: 0.995
+  n0: 50                        # row weight n/(n+n0): statistics over few cells count less
+  context_balance: 0.5          # how often a context is drawn ~ knockdowns ** 0.5 (Orion has the most)
+  epochs: 30                    # holdout / crossval: maximum (the best held-out epoch is kept)
+  patience: 6
+  full_epochs: 10               # full mode: exact; set it from `make gene-crossval`
+  # checkpoint: runs/v3_0_0/gene/holdout_VCC25__adata_Validation   # stage 2's gene model folder (default: same holdout)
+
+# ---- STAGE 1: the mean model (make mean-crossval / mean-holdout / mean-full) ----------------
+mean:
+  n_c: 20                       # PCs of the line's average control cell the network sees (few: ~7 lines)
+  c_noise: 0.5                  # noise on C in training (PC standard deviations) -- keeps it from
+  c_drop: 0.3                   #   becoming a lookup of the ~7 training lines; share of rows with C hidden
+  enc: 256
+  hidden: 512
+  dropout: 0.1
+  ctrl_cells: 5000              # control cells per line for C and e
+  n0: 50                        # row weight n/(n+n0): averages over few cells count less
+  context_balance: 0.5          # per-context row weight ~ rows ** -0.5 (Orion has most rows)
+  batch_size: 256
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  ema_decay: 0.99
+  epochs: 80                    # holdout / crossval: maximum (the best held-out epoch is kept)
+  patience: 15
+  full_epochs: 4                # full mode: exact; from `make mean-crossval` (2026-09-30: median best epoch 4)
+  # checkpoint: runs/v2_0_0/mean/holdout_VCC25__adata_Validation/mean.pt   # override stage 2's default
+
+# ---- optional STAGE 2: a centered flow on top (make gene-flow-holdout / gene-flow-full) -------------
+# The flow adds only the scatter around each knockdown's average; the average comes from the
+# gene model (move only -- the gene model's stretch and the flow would otherwise both widen the cloud).
+model:
+  stage1: gene                  # the flow's average comes from the gene model (v2: mean)
+  centered: true                # two-stage: the flow learns only the scatter (needs the stage-1 mean.pt)
+  anchor: false                 # the v1 anchor put the average inside the flow; the mean model owns it now
+  hidden: 1024
+  n_blocks: 4
+  pert_dim: 1024
+  fp_hidden: 1024
+  time_dim: 20
+  dropout: 0.1
+  mag_max: 100                  # hard cap on the flow's per-cell move (PC units)
+  other_genes: linear           # genes outside the ~6.1k model genes: the linear population-mean model
+  outside_pcs: linear           # model genes: + the linear shift's part OUTSIDE the 1024 PCs (they hold only
+                                #   ~35-58% of a knockdown's effect). VCC25 Val: linear PC +0.075 -> +0.103
+  learn_gains: false
+
+train:
+  device: auto
+  ema_decay: 0.999              # judge/save an average of the weights (~last 1000 steps); 0 = off
+  context_balance: 0.7
+  pert_cap: 100
+  max_epochs: 30
+  full_epochs: 30
+  early_stop:
+    metric: vcc
+    patience: 8
+    window: 3
+    min_delta: 0.005
+
+  cell_eval_every: 2
+  cell_eval_steps: 20           # Euler steps (10 shrank every cell's spread by ~12%)
+  cell_eval_min_cells: 50
+  cell_eval_max_cells: 500
+
+  nodelta_cap: 0.15
+  num_workers: 4
+  block_cells: 1024
+  blocks_per_task: 4
+  prefetch_factor: 2
+  val_workers: 2
+  persistent_workers: false
+
+  batch_size: 512
+  lr: 1.0e-4
+  warmup_steps: 500
+  lr_min: 1.0e-6
+  weight_decay: 1.0e-2
+  sigma: 0.05

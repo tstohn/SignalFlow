@@ -27,7 +27,6 @@ model:
   hidden: 512
   n_blocks: 3
   pert_dim: 64
-  state_dim: 64
   time_dim: 32
   dropout: 0.0
   head: plain                   # "plain" | "dirmag" (direction x magnitude)

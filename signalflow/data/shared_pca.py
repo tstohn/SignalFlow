@@ -121,6 +121,22 @@ def project(
     return np.linalg.solve(gram, rhs).T.astype(np.float32)   # [n, K]
 
 
+def make_projector(gene_idx: np.ndarray, loadings: np.ndarray, mu: np.ndarray, ridge: float = 1e-2):
+    """`project` for MANY blocks of one context: the K x K solve depends only on
+    `gene_idx`, so it is done once here instead of once per block. Returns `f(X) -> [n, K]`
+    with the same result as `project(gene_idx, X, loadings, mu)` (same float64 math)."""
+    K = loadings.shape[0]
+    A = loadings[:, gene_idx].astype(np.float64)                     # [K, |gi|]
+    W = np.linalg.solve(A @ A.T + ridge * np.eye(K), A)              # [K, |gi|]
+    WT = np.ascontiguousarray(W.T)
+    off = mu[gene_idx].astype(np.float64) @ WT                       # [K]   (X - mu) @ W.T = X @ W.T - off
+
+    def f(X: np.ndarray) -> np.ndarray:
+        return (X.astype(np.float64) @ WT - off).astype(np.float32)
+
+    return f
+
+
 def save(path, loadings: np.ndarray, mu: np.ndarray) -> None:
     np.savez_compressed(path, loadings=loadings, mu=mu)
 

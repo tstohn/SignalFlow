@@ -49,13 +49,16 @@ WHERE `vcc` IS
     A `uv tool` installs it in its own environment, not in this venv. The
     script looks for it next to this Python, then on PATH, then in
     `~/.local/bin` (where `uv tool` puts it); `--vcc-bin` overrides all three.
-    Login is not handled here: `vcc login`, or `export VCC_TOKEN=...`, as the
-    challenge's CLI guide describes.
+    Not logged in? `upload` and `submit` prompt for an API token in the terminal
+    (hidden input, like a password) before packaging starts, and use it only for
+    that run -- nothing is written to disk. Skip the prompt with `vcc login`
+    beforehand, or `export VCC_TOKEN=...`, as the challenge's CLI guide describes.
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import shutil
@@ -115,6 +118,37 @@ def find_vcc(explicit: str | None) -> str:
         "cannot find the `vcc` command. Install it with `uv tool install vcc-cli` "
         "(then `uv tool update-shell`), or pass its path with --vcc."
     )
+
+
+def is_logged_in(vcc: str, token: str | None = None) -> bool:
+    """True if `vcc whoami` succeeds -- a stored login, or `token` / an already-set VCC_TOKEN."""
+    env = {**os.environ, "VCC_TOKEN": token} if token else None
+    r = subprocess.run([vcc, "whoami", "--json"], capture_output=True, text=True, env=env)
+    return r.returncode == 0
+
+
+def ensure_token(vcc: str) -> str | None:
+    """None if already authenticated; otherwise prompts for a token in the terminal (hidden
+    input, verified against the portal before returning) and hands it back to inject into the
+    `vcc submit` subprocess only -- nothing is written to disk or the shell's history.
+
+    Called before packaging, not just before upload: a missing login should stop `submit`
+    before the slow, RAM-hungry `vcc prep` step, not after it.
+    """
+    if is_logged_in(vcc):
+        return None
+    print("\nNot logged in to the VCC portal.")
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "no terminal to prompt for a token on. Set VCC_TOKEN, or run "
+            "`vcc login --token-stdin` first."
+        )
+    token = getpass.getpass("VCC API token (from your Credentials page; input hidden): ").strip()
+    if not token:
+        raise SystemExit("no token entered; nothing was sent.")
+    if not is_logged_in(vcc, token):
+        raise SystemExit("that token was not accepted by the portal.")
+    return token
 
 
 def read_controls(controls: Path) -> dict:
@@ -262,14 +296,19 @@ def package(args, vcc: str, dry_run: bool = False) -> Path:
     return out
 
 
-def upload(args, vcc: str, vcc_file: Path) -> int:
-    """Confirm, then `vcc submit`. This is the step that sends data to the portal."""
+def upload(args, vcc: str, vcc_file: Path, token: str | None = None) -> int:
+    """Confirm, then `vcc submit`. This is the step that sends data to the portal.
+
+    `token`, if given (from `ensure_token`), is injected into this subprocess's
+    environment only -- it never touches this process's own os.environ or disk.
+    """
     if not vcc_file.is_file():
         raise SystemExit(f"{vcc_file} does not exist; run `package` first")
     confirm_upload(vcc_file, args.model_name, args.yes)
     cmd = submit_command(vcc, vcc_file, args.model_name, args.description, args.wait)
     print("\n  $ " + " ".join(cmd) + "\n")
-    return subprocess.run(cmd).returncode
+    env = {**os.environ, "VCC_TOKEN": token} if token else None
+    return subprocess.run(cmd, env=env).returncode
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -320,10 +359,12 @@ def main(argv=None) -> None:
             print(f"\npackaged -> {out}\nnothing has been uploaded. To upload it:\n"
                   f"  python -m signalflow.submission.submit_vcc26 upload --file {out} -m \"<model name>\" --wait")
     elif args.command == "upload":
-        raise SystemExit(upload(args, vcc, Path(args.file)))
+        token = ensure_token(vcc)
+        raise SystemExit(upload(args, vcc, Path(args.file), token))
     else:  # submit
+        token = ensure_token(vcc)
         out = package(args, vcc)
-        raise SystemExit(upload(args, vcc, out))
+        raise SystemExit(upload(args, vcc, out, token))
 
 
 if __name__ == "__main__":
